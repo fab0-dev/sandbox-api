@@ -1,0 +1,160 @@
+operations:
+  - name: pay_order
+    summary: >-
+      Pay one order by card, for the amount given, in one attempt. Called by the web checkout.
+      A decline is a normal answer (HTTP 201 with outcome "declined"), not an error. A refused
+      request (invalid card, bad amount, order already paid) tries no payment and records no attempt.
+    request:
+      http: "POST /payments"
+      content_type: application/json
+      headers:
+        Idempotency-Key: >-
+          Optional string, 1 to 255 characters. The checkout should send a fresh key for each
+          submit of the form and reuse it when it resends the same submit (retry after a network
+          failure, double click). A repeated key with the same body returns the first answer
+          without a new attempt and with the header "Idempotency-Replayed: true". A repeated key
+          with a different body is refused (see "idempotency_key_reused"). A new key after a
+          decline is a new attempt (D5).
+      body:
+        order_reference: "string, required, non-empty. Opaque to the service."
+        amount: "integer, required, minor units (cents) of the currency, greater than 0. Example: 2599 is 25.99."
+        currency: "string, required, ISO 4217 code in upper case, three letters. Example: USD."
+        card:
+          cardholder_name: "string, required, non-blank, at most 100 characters"
+          number: "string, required, 12 to 19 digits; spaces and dashes are ignored; must pass the Luhn check"
+          expiry_month: "integer, required, 1 to 12"
+          expiry_year: "integer, required, four digits (2026) or two digits (26, meaning 2026)"
+          security_code: "string, required, digits only, 3 digits, or 4 digits for American Express cards"
+    response:
+      succeeded:
+        http: "201 Created (200 OK when replayed by Idempotency-Key)"
+        body:
+          payment: &payment
+            payment_reference: "string, for example pay_8f3a1c. Unique."
+            order_reference: "string, as sent"
+            amount: "integer, minor units, as sent"
+            currency: "string, as sent"
+            outcome: "'succeeded' or 'declined'"
+            decline_reason: "string or null. null when succeeded. One of card_declined, insufficient_funds, expired_card, incorrect_card_details, processing_error when declined."
+            message: "string. For declined, a plain-words message the checkout shows to the customer as is. For succeeded, a short confirmation."
+            card:
+              brand: "one of visa, mastercard, amex, discover, unknown"
+              last4: "string, four digits. The only part of the card number ever returned."
+            created_at: "string, ISO 8601 in UTC with a trailing Z, for example 2026-10-18T14:03:22Z"
+          order_paid: "boolean. true when this attempt succeeded."
+      declined:
+        http: "201 Created (200 OK when replayed by Idempotency-Key)"
+        body:
+          payment: "same shape as above, with outcome 'declined', a decline_reason and a message"
+          order_paid: false
+        notes: "The order stays unpaid and the checkout may submit again with a new Idempotency-Key (D5)."
+      refused:
+        description: >-
+          No payment was tried and nothing was recorded. All refusals share one body shape,
+          { "error": { "code", "message", "fields" } }. "message" is plain words the checkout can
+          show. "fields" is present only for validation_failed.
+        validation_failed:
+          http: "422 Unprocessable Entity"
+          body:
+            error:
+              code: validation_failed
+              message: "string"
+              fields:
+                - field: "one of cardholder_name, number, expiry, security_code. 'expiry' covers both expiry_month and expiry_year. All invalid fields are listed, in that order."
+                  code: "one of required, invalid_format, invalid_number (fails the check digit), expired, invalid_length (security code of the wrong length for the brand)"
+                  message: "string, plain words for the customer, for example 'Enter the 16-digit number from the front of your card.'"
+        invalid_amount:
+          http: "422 Unprocessable Entity"
+          body:
+            error: {code: invalid_amount, message: "string, amount is missing, not an integer or not greater than 0"}
+        invalid_request:
+          http: "400 Bad Request"
+          body:
+            error: {code: invalid_request, message: "string, body is not valid JSON, is not an object, or order_reference or currency is missing or malformed"}
+        order_already_paid:
+          http: "409 Conflict"
+          body:
+            error:
+              code: order_already_paid
+              message: "string, plain words, for example 'This order has already been paid.'"
+              order_reference: "string"
+        idempotency_key_reused:
+          http: "422 Unprocessable Entity"
+          body:
+            error: {code: idempotency_key_reused, message: "string, the key was used for a different request"}
+      other_errors:
+        http: "500 Internal Server Error with the same error body shape, code internal_error. No guarantee about whether an attempt was recorded; the checkout should read order_payment_status before it submits again."
+
+  - name: order_payment_status
+    summary: >-
+      Tell whether an order is paid and list its payment attempts, newest first. Called by the
+      web checkout and by the shop.
+    request:
+      http: "GET /orders/{order_reference}/payments"
+      path:
+        order_reference: "string, URL-encoded"
+    response:
+      ok:
+        http: "200 OK. An order with no attempts is answered as unpaid with an empty list, not as an error."
+        body:
+          order_reference: "string"
+          paid: "boolean. true when at least one attempt for the order succeeded."
+          payments: "array of payment (shape as in pay_order), newest first by created_at, ties broken by the later attempt first. Empty when none."
+      errors:
+        http: "500 with the standard error body"
+
+  - name: list_payments
+    summary: >-
+      List recorded payments across all orders, newest first, optionally narrowed to one outcome.
+      Called by the shop.
+    request:
+      http: "GET /payments"
+      query:
+        outcome: "optional, 'succeeded' or 'declined'. Omit for all."
+        limit: "optional integer, 1 to 500, default 100. Returns the newest `limit` payments."
+    response:
+      ok:
+        http: "200 OK"
+        body:
+          payments: "array of payment (shape as in pay_order), newest first. Empty when none."
+      refused:
+        http: "400 Bad Request"
+        body:
+          error: {code: invalid_request, message: "string, outcome is not 'succeeded' or 'declined', or limit is out of range"}
+
+  - name: test_cards
+    summary: >-
+      Documentation, not a call: the test card details that produce each outcome, kept in
+      docs/test-cards.md of the service repository (D11). The service runs in test mode only and no money moves.
+    request:
+      kind: documentation
+      path: docs/test-cards.md
+    response:
+      test_mode_rule: >-
+        Card numbers below give the outcome shown for any valid cardholder name, any expiry that
+        is not in the past and any security code of the right length (3 digits; 4 for amex).
+        Any other number that passes the Luhn check is approved (succeeded).
+      cards:
+        - {number: "4242424242424242", brand: visa, outcome: succeeded}
+        - {number: "5555555555554444", brand: mastercard, outcome: succeeded}
+        - {number: "4000000000000002", brand: visa, outcome: declined, decline_reason: card_declined}
+        - {number: "4000000000009995", brand: visa, outcome: declined, decline_reason: insufficient_funds}
+        - {number: "4000000000000069", brand: visa, outcome: declined, decline_reason: expired_card}
+        - {number: "4000000000000127", brand: visa, outcome: declined, decline_reason: incorrect_card_details}
+        - {number: "4000000000000119", brand: visa, outcome: declined, decline_reason: processing_error}
+
+notes: |
+  Choices made where the spec left a question open (the run can change them):
+
+  - Transport: a JSON HTTP service, standard library only (the repository is Python 3.12 with no dependencies). Request and response bodies are application/json, UTF-8. The server entry point is `python3 -m payments`; the README gives the host and port. The caller supplies the base URL. No authentication in this Story.
+  - Payment provider (spec open question 1): none. Payments run in test mode and the outcome comes from the card number as in the test_cards operation. A processing_error decline is temporary and the order stays payable.
+  - Amount (open question 2): the caller passes the amount and the service charges it as sent. The service does not check it against an order record. The service does not keep orders; an order is "paid" when one of its attempts succeeded. A different amount or currency for an order that is already paid is still refused as order_already_paid.
+  - Money: amount is an integer in minor units, never a float. Currency is explicit on every payment (open question 4). The service does not check that the currency has two decimal places.
+  - Shop access (open question 3): the shop uses list_payments and order_payment_status. No back-office screen.
+  - Card data (D10): the full card number and the security code are used only inside the pay_order call. They are not stored, logged, returned, listed or echoed in error messages, including validation messages. Only card.brand and card.last4 appear anywhere else.
+  - Distinguishing the three answers: succeeded and declined are HTTP 201 (200 on idempotent replay) and carry a "payment" with an "outcome". Refused is a 4xx with an "error" and no "payment". The checkout reads the "outcome" for the first two and "error.code" for the third.
+  - Double submit (D7): the service serialises attempts per order, so two simultaneous requests for one order run one after the other. If the first succeeds, the second is refused with order_already_paid. If the first is declined, the second is a separate attempt unless it carries the same Idempotency-Key, in which case it gets the first answer. The checkout must also disable its submit button while a request is open and should send an Idempotency-Key.
+  - Decline messages shown as is: card_declined "Your card was declined. Try another card."; insufficient_funds "Your card has insufficient funds. Try another card."; expired_card "Your card has expired. Check the expiry date or use another card."; incorrect_card_details "Some of your card details are incorrect. Check them and try again."; processing_error "We could not process the payment right now. Please try again." The wording is final unless the service team changes it; the checkout must show `message` and not hard-code it, and should key any styling on `decline_reason`.
+  - Validation timing: validation and the already-paid check happen before any attempt. When both apply, validation_failed is returned first.
+  - Ordering: lists are newest first by created_at; attempts with the same time are ordered by the later one first.
+  - Unknown paths return 404 and unsupported methods 405, both with the standard error body (codes not_found and method_not_allowed).
