@@ -1,0 +1,6 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+artifact: feedback
+kind: store
+store: {format: markdown}
+verify:
+  - sections: [Delivered, Deviations, Open questions]

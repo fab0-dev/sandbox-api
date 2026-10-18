@@ -1,0 +1,33 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+pipeline: delivery
+# A call makes the item, with this label, as a sub-issue of the caller's item. A person may add it by hand too.
+trigger: {issue: {label: delivery}}
+inputs:
+  spec: {default: request} # a caller's spec, or the item's own body when the run is started by hand
+  upstream: {optional: true} # another team's contract, when the caller binds one
+outputs: [contract, feedback]
+onStart:
+  - git.run-branch
+  - pr.open-run: {draft: true}
+steps:
+  # The task list, and whether this team provides a contract, reviewed in a pull request of the runs repository.
+  - step: plan
+    gate: {human: {owner: developer}}
+  - when: {artifact: scope, path: contract, equals: true}
+    steps:
+      - step: contract
+        gate: {auto: {agent: reviewer, model: deep}, merge: auto, retry: 2, then: human}
+  - foreach: tasks
+    id: tasks
+    onStart:
+      - tracker.child.sync: {type: Task, title: "{unit.title}"}
+    steps:
+      - step: implement
+        gate: {auto: {agent: reviewer, model: deep}, merge: auto, retry: 2, then: human}
+    onEnd:
+      - tracker.child.close: {type: Task}
+  # What this team delivered, about its own area only: the caller judges the whole.
+  - step: report
+onEnd:
+  - git.sync-base
+  - pr.ready

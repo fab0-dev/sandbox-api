@@ -1,0 +1,6 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+artifact: tasks
+kind: store
+store: {format: yaml}
+schema: .fab0/schemas/tasks.json
+elements: {id: id, title: title, after: depends_on, paths: files}

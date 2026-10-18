@@ -1,0 +1,29 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+# A connected factory: one team's delivery in its own repository, called by a parent factory or run on its own.
+# It plans from the spec it is given, provides a contract when other teams build against it, implements each task
+# with an agent's review, and reports on its own area. A person merges the run into main.
+schema: 2
+repos:
+  # EDIT: this repository, as the parent's `factories` names it, and any other repository tasks may change.
+  home: {path: ., github: fab0-dev/sandbox-api, owner: developer}
+people:
+  # EDIT: the GitHub users in each role.
+  developer: {github: [eugenefurs]}
+tracker:
+  kind: github
+  owner: fab0-dev
+  project: 3
+  fields: {signal: Waiting on}
+git:
+  base: main
+  branching: run
+  auto_merge: {into: [run]}
+parallel: {max: 3, cross_run: warn}
+# EDIT: the parent's runs repository. This factory keeps its runs there under its own project, by default this
+# repository's name.
+store: {github: fab0-dev/sandbox-runs}
+models:
+  claude-code: {deep: opus, balanced: sonnet, fast: haiku}
+profiles:
+  cheap: {models: {claude-code: {deep: sonnet, balanced: sonnet}}}
+pipelines: [delivery]
