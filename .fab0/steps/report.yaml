@@ -1,0 +1,9 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+step: report
+agent: reporter
+model: balanced
+inputs: [spec, upstream, tasks]
+outputs: [feedback]
+repos: {read: [all]}
+return: {questions: optional}
+owner: developer

@@ -1,0 +1,4 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+artifact: reviews
+kind: pr
+pr: {of: unit, part: reviews}

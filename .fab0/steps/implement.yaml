@@ -1,0 +1,9 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+step: implement
+agent: implementer
+model: balanced
+inputs: [spec, upstream, tasks, unit, reviews]
+repos: {write: [home], read: [all]}
+paths: unit.paths
+return: {questions: optional}
+owner: developer

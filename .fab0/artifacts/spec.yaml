@@ -1,0 +1,4 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+artifact: spec
+kind: store
+store: {format: markdown}

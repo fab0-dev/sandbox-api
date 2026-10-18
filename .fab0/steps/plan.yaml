@@ -1,0 +1,9 @@
+# from fab0-dev/fab0-examples delivery--v0.1.0
+step: plan
+agent: planner
+model: deep
+inputs: [spec, reviews]
+outputs: [tasks, scope]
+repos: {read: [all]}
+return: {questions: optional}
+owner: developer
