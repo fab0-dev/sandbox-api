@@ -14,7 +14,9 @@ operations:
           failure, double click). A repeated key with the same body returns the first answer
           without a new attempt and with the header "Idempotency-Replayed: true". A repeated key
           with a different body is refused (see "idempotency_key_reused"). A new key after a
-          decline is a new attempt (D5).
+          decline is a new attempt (D5). Only succeeded and declined answers are remembered under
+          a key; a refusal is not, so a repeated key after a refusal is judged afresh.
+          Browsers can send and read this header (see "cors" in the notes).
       body:
         order_reference: "string, required, non-empty. Opaque to the service."
         amount: "integer, required, minor units (cents) of the currency, greater than 0. Example: 2599 is 25.99."
@@ -51,8 +53,13 @@ operations:
       refused:
         description: >-
           No payment was tried and nothing was recorded. All refusals share one body shape,
-          { "error": { "code", "message", "fields" } }. "message" is plain words the checkout can
-          show. "fields" is present only for validation_failed.
+          { "error": { "code", "message", ... } }. "message" is plain words the checkout can
+          show. Two optional members exist: "fields", present only for validation_failed, and
+          "order_reference", present only for order_already_paid. A refusal is never replayed
+          or remembered under an Idempotency-Key. When more than one refusal applies, the first
+          in this order is returned: invalid_request, invalid_amount, validation_failed,
+          idempotency_key_reused, order_already_paid. (A repeated key with the same body is
+          replayed before the already-paid check, so a replay of a success is a 200, not a 409.)
         validation_failed:
           http: "422 Unprocessable Entity"
           body:
@@ -99,7 +106,7 @@ operations:
         body:
           order_reference: "string"
           paid: "boolean. true when at least one attempt for the order succeeded."
-          payments: "array of payment (shape as in pay_order), newest first by created_at, ties broken by the later attempt first. Empty when none."
+          payments: "array of payment (shape as in pay_order), newest first by created_at, ties broken by the later attempt first. Empty when none. Not paged, on purpose: one order has few attempts."
       errors:
         http: "500 with the standard error body"
 
@@ -111,16 +118,18 @@ operations:
       http: "GET /payments"
       query:
         outcome: "optional, 'succeeded' or 'declined'. Omit for all."
-        limit: "optional integer, 1 to 500, default 100. Returns the newest `limit` payments."
+        limit: "optional integer, 1 to 500, default 100. Page size."
+        cursor: "optional opaque string, the next_cursor of the previous page. Omit for the first (newest) page."
     response:
       ok:
         http: "200 OK"
         body:
-          payments: "array of payment (shape as in pay_order), newest first. Empty when none."
+          payments: "array of payment (shape as in pay_order), newest first, at most `limit`. Empty when none."
+          next_cursor: "string or null. Send it as `cursor` to get the next older page. null when there are no older payments. Paging runs back through every recorded payment, so the shop can reach the oldest."
       refused:
         http: "400 Bad Request"
         body:
-          error: {code: invalid_request, message: "string, outcome is not 'succeeded' or 'declined', or limit is out of range"}
+          error: {code: invalid_request, message: "string, outcome is not 'succeeded' or 'declined', limit is out of range, or cursor is not one this service issued"}
 
   - name: test_cards
     summary: >-
@@ -146,15 +155,17 @@ operations:
 notes: |
   Choices made where the spec left a question open (the run can change them):
 
-  - Transport: a JSON HTTP service, standard library only (the repository is Python 3.12 with no dependencies). Request and response bodies are application/json, UTF-8. The server entry point is `python3 -m payments`; the README gives the host and port. The caller supplies the base URL. No authentication in this Story.
+  - Transport: a JSON HTTP service, standard library only (the repository is Python 3.12 with no dependencies). Request and response bodies are application/json, UTF-8. The server entry point is `python3 -m payments`. Default base URL: http://127.0.0.1:8000 (host 127.0.0.1, port 8000). The entry point takes `--host` and `--port` to change them, and the README repeats these defaults; the contract is what the web team builds against. The web checkout should keep the base URL in one configurable place. No authentication in this Story.
+  - cors: the web checkout runs in a browser on another origin, so the service answers cross-origin calls. Origin policy: any origin is allowed (`Access-Control-Allow-Origin: *`), with no credentials and no cookies, because this Story has no authentication and runs in test mode only. Restricting origins is for the Story that adds authentication. Every response, errors and 404 and 405 included, carries `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Idempotency-Replayed`. The service answers an `OPTIONS` preflight on `/payments` and `/orders/{order_reference}/payments` with `204 No Content`, an empty body, and `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Idempotency-Key` and `Access-Control-Max-Age: 600`. A browser can therefore send POST /payments with Content-Type application/json and an Idempotency-Key header, and can read the Idempotency-Replayed response header.
   - Payment provider (spec open question 1): none. Payments run in test mode and the outcome comes from the card number as in the test_cards operation. A processing_error decline is temporary and the order stays payable.
   - Amount (open question 2): the caller passes the amount and the service charges it as sent. The service does not check it against an order record. The service does not keep orders; an order is "paid" when one of its attempts succeeded. A different amount or currency for an order that is already paid is still refused as order_already_paid.
   - Money: amount is an integer in minor units, never a float. Currency is explicit on every payment (open question 4). The service does not check that the currency has two decimal places.
   - Shop access (open question 3): the shop uses list_payments and order_payment_status. No back-office screen.
-  - Card data (D10): the full card number and the security code are used only inside the pay_order call. They are not stored, logged, returned, listed or echoed in error messages, including validation messages. Only card.brand and card.last4 appear anywhere else.
+  - Card data (D10): the full card number and the security code are used only inside the pay_order call. They are not stored, logged, returned, listed or echoed in error messages, including validation messages. Only card.brand and card.last4 appear anywhere else. The Idempotency-Key "same body" check keeps one thing derived from the request: a keyed digest (HMAC-SHA-256 with a secret random key held by the service) over order_reference, amount, currency and the card's cardholder name, brand, last four digits and expiry. It is computed without the full card number and without the security code, and the digest is never returned. So two requests that differ only in the middle digits of the card number or in the security code count as the same body.
   - Distinguishing the three answers: succeeded and declined are HTTP 201 (200 on idempotent replay) and carry a "payment" with an "outcome". Refused is a 4xx with an "error" and no "payment". The checkout reads the "outcome" for the first two and "error.code" for the third.
   - Double submit (D7): the service serialises attempts per order, so two simultaneous requests for one order run one after the other. If the first succeeds, the second is refused with order_already_paid. If the first is declined, the second is a separate attempt unless it carries the same Idempotency-Key, in which case it gets the first answer. The checkout must also disable its submit button while a request is open and should send an Idempotency-Key.
   - Decline messages shown as is: card_declined "Your card was declined. Try another card."; insufficient_funds "Your card has insufficient funds. Try another card."; expired_card "Your card has expired. Check the expiry date or use another card."; incorrect_card_details "Some of your card details are incorrect. Check them and try again."; processing_error "We could not process the payment right now. Please try again." The wording is final unless the service team changes it; the checkout must show `message` and not hard-code it, and should key any styling on `decline_reason`.
-  - Validation timing: validation and the already-paid check happen before any attempt. When both apply, validation_failed is returned first.
+  - Validation timing: validation and the already-paid check happen before any attempt. Refusals follow one fixed order, see "refused" under pay_order: invalid_request, invalid_amount, validation_failed, idempotency_key_reused, order_already_paid. A refusal is not recorded and not replayed for a repeated Idempotency-Key.
   - Ordering: lists are newest first by created_at; attempts with the same time are ordered by the later one first.
-  - Unknown paths return 404 and unsupported methods 405, both with the standard error body (codes not_found and method_not_allowed).
+  - Unknown paths return 404 (code not_found). On a known path, a method other than the ones listed for it and OPTIONS returns 405 (code method_not_allowed), with an `Allow` header. Both use the standard error body. OPTIONS on a known path is a CORS preflight and is never a 405.
+  - List paging (list_payments): paging by `limit` and `cursor` is the way to reach older payments; there is no total count. order_payment_status is deliberately not paged.
