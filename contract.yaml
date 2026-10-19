@@ -16,7 +16,9 @@ operations:
           with a different body is refused (see "idempotency_key_reused"). A new key after a
           decline is a new attempt (D5). Only succeeded and declined answers are remembered under
           a key; a refusal is not, so a repeated key after a refusal is judged afresh.
-          Browsers can send and read this header (see "cors" in the notes).
+          Browsers on another origin can send this header and the preflight allows it; the
+          response header "Idempotency-Replayed" is readable from script (see the "cross_origin"
+          operation).
       body:
         order_reference: "string, required, non-empty. Opaque to the service."
         amount: "integer, required, minor units (cents) of the currency, greater than 0. Example: 2599 is 25.99."
@@ -69,7 +71,7 @@ operations:
               fields:
                 - field: "one of cardholder_name, number, expiry, security_code. 'expiry' covers both expiry_month and expiry_year. All invalid fields are listed, in that order."
                   code: "one of required, invalid_format, invalid_number (fails the check digit), expired, invalid_length (security code of the wrong length for the brand)"
-                  message: "string, plain words for the customer, for example 'Enter the 16-digit number from the front of your card.'"
+                  message: "string, plain words for the customer. Always one of the texts in the field_messages operation, word for word."
         invalid_amount:
           http: "422 Unprocessable Entity"
           body:
@@ -131,6 +133,80 @@ operations:
         body:
           error: {code: invalid_request, message: "string, outcome is not 'succeeded' or 'declined', limit is out of range, or cursor is not one this service issued"}
 
+  - name: cross_origin
+    summary: >-
+      Cross-origin access, offered to the web checkout, which runs in a browser on another origin
+      (another host or port) than the service. Applies to pay_order and order_payment_status,
+      and in the same way to list_payments and every error answer. It changes no body and no status.
+    request:
+      http: "OPTIONS /payments and OPTIONS /orders/{order_reference}/payments (preflight)"
+      headers:
+        Origin: "any origin; not checked"
+        Access-Control-Request-Method: "POST for /payments, GET for /orders/{order_reference}/payments (not checked: any value, or none, gets the same answer)"
+        Access-Control-Request-Headers: "for example 'content-type,idempotency-key', in any case and any order, with or without spaces (not checked: the answer always lists the allowed headers)"
+      body: "none expected; ignored if present"
+    response:
+      preflight:
+        http: "204 No Content, empty body"
+        headers:
+          Access-Control-Allow-Origin: "*"
+          Access-Control-Allow-Methods: "GET, POST, OPTIONS"
+          Access-Control-Allow-Headers: "Content-Type, Idempotency-Key"
+          Access-Control-Max-Age: "600"
+          Access-Control-Expose-Headers: "Idempotency-Replayed"
+        notes: "Never 405, never 4xx, on these two paths. The answer has no Access-Control-Allow-Credentials: the checkout sends no cookies and no credentials. A preflight on an unknown path is 404 not_found, with Access-Control-Allow-Origin: * as every answer."
+      actual_request:
+        description: >-
+          Every answer to a real request, whatever its status, carries these headers: 201
+          and 200 (replay) from pay_order, 200 and 500 from order_payment_status, and the
+          error answers 400, 404, 405, 409, 422 and 500.
+        headers:
+          Access-Control-Allow-Origin: "*"
+          Access-Control-Expose-Headers: "Idempotency-Replayed"
+          Idempotency-Replayed: "'true' on a 200 replay of pay_order, absent on every other answer. Script on the checkout's origin can read it because it is exposed."
+      note_for_the_checkout: >-
+        A POST with Content-Type application/json and an Idempotency-Key header is not a simple
+        request, so the browser sends the preflight first; both succeed as described. Do not
+        send credentials (keep the default fetch credentials mode, "same-origin"), because the allowed origin is "*".
+
+  - name: field_messages
+    summary: >-
+      Documentation, not a call: the reference wording of the card-check messages. The
+      checkout shows these same texts, word for word, for the same field and the same mistake.
+      The service returns exactly one of these texts as "message" of each entry of
+      error.fields in a validation_failed refusal. The same table is kept in payments/cards.py
+      and listed in docs/field-messages.md of the service repository, linked from the README;
+      a test checks that the document matches the table.
+    request:
+      kind: documentation
+      path: docs/field-messages.md
+    response:
+      field_order: "cardholder_name, number, expiry, security_code. A refusal lists every invalid field, in that order, one entry per field."
+      messages:
+        - {field: cardholder_name, code: required, message: "Enter the name on the card.", when: "missing, null, or blank (only spaces)"}
+        - {field: cardholder_name, code: invalid_format, message: "Enter the name on the card, up to 100 characters.", when: "not a string, longer than 100 characters after trimming, or contains a control character"}
+        - {field: number, code: required, message: "Enter your card number.", when: "missing, null, or empty after removing spaces and dashes"}
+        - {field: number, code: invalid_format, message: "Enter the card number using digits only, 12 to 19 of them. Spaces and dashes are fine.", when: "not a string, contains anything but digits, spaces and dashes, or has fewer than 12 or more than 19 digits"}
+        - {field: number, code: invalid_number, message: "This card number is not valid. Check it and try again.", when: "12 to 19 digits that fail the check digit (Luhn)"}
+        - {field: expiry, code: required, message: "Enter the expiry date, month and year.", when: "expiry_month or expiry_year missing or null"}
+        - {field: expiry, code: invalid_format, message: "Enter a valid expiry date, month 1 to 12 and a year such as 2030.", when: "month or year not an integer, month outside 1 to 12, or year neither two digits (0 to 99, meaning 2000 to 2099) nor four digits"}
+        - {field: expiry, code: expired, message: "This card has expired. Check the expiry date or use another card.", when: "the month is before the current month (UTC); the current month is fine"}
+        - {field: security_code, code: required, message: "Enter the security code from your card.", when: "missing, null or empty"}
+        - {field: security_code, code: invalid_format, message: "The security code has digits only.", when: "not a string or contains anything but digits"}
+        - {field: security_code, code: invalid_length, brand: "visa, mastercard, discover, unknown (a number that passes the check but starts like no known brand)", message: "Enter the 3-digit security code from the back of your card.", when: "not exactly 3 digits"}
+        - {field: security_code, code: invalid_length, brand: amex, message: "Enter the 4-digit security code from the front of your American Express card.", when: "not exactly 4 digits"}
+        - {field: security_code, code: invalid_length, brand: "not known because the number is missing or malformed (number code required or invalid_format)", message: "The security code has 3 or 4 digits.", when: "not 3 or 4 digits"}
+      brand_rule: >-
+        The brand for the security code message comes from the leading digits of the number: 4 is
+        visa, 34 and 37 are amex, 51 to 55 and 2221 to 2720 are mastercard, 6011, 65, 644 to 649
+        and 622126 to 622925 are discover, anything else is unknown. A number that fails the check
+        digit still has a brand (code invalid_number). Only a missing or malformed number leaves
+        the brand not known, and then the "3 or 4 digits" text is used.
+      not_in_the_table: >-
+        No other message is returned in error.fields. The refusal's own "message" under
+        validation_failed is a summary sentence and is not a field message. Decline messages
+        (decline_reason) are unchanged and are not part of this table.
+
   - name: test_cards
     summary: >-
       Documentation, not a call: the test card details that produce each outcome, kept in
@@ -156,7 +232,9 @@ notes: |
   Choices made where the spec left a question open (the run can change them):
 
   - Transport: a JSON HTTP service, standard library only (the repository is Python 3.12 with no dependencies). Request and response bodies are application/json, UTF-8. The server entry point is `python3 -m payments`. Default base URL: http://127.0.0.1:8000 (host 127.0.0.1, port 8000). The entry point takes `--host` and `--port` to change them, and the README repeats these defaults; the contract is what the web team builds against. The web checkout should keep the base URL in one configurable place. No authentication in this Story.
-  - cors: the web checkout runs in a browser on another origin, so the service answers cross-origin calls. Origin policy: any origin is allowed (`Access-Control-Allow-Origin: *`), with no credentials and no cookies, because this Story has no authentication and runs in test mode only. Restricting origins is for the Story that adds authentication. Every response, errors and 404 and 405 included, carries `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Idempotency-Replayed`. The service answers an `OPTIONS` preflight on `/payments` and `/orders/{order_reference}/payments` with `204 No Content`, an empty body, and `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Idempotency-Key` and `Access-Control-Max-Age: 600`. A browser can therefore send POST /payments with Content-Type application/json and an Idempotency-Key header, and can read the Idempotency-Replayed response header.
+  - cors: the web checkout runs in a browser on another origin, so the service answers cross-origin calls, as the cross_origin operation says. Origin policy: any origin is allowed (`Access-Control-Allow-Origin: *`), with no credentials and no cookies, because this Story has no authentication and runs in test mode only. Restricting origins is for the Story that adds authentication. Every response, errors and 404 and 405 included, carries `Access-Control-Allow-Origin: *` and `Access-Control-Expose-Headers: Idempotency-Replayed`. The service answers an `OPTIONS` preflight on `/payments` and `/orders/{order_reference}/payments` with `204 No Content`, an empty body, and `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Idempotency-Key`, `Access-Control-Expose-Headers: Idempotency-Replayed` and `Access-Control-Max-Age: 600`. The preflight does not look at Access-Control-Request-Method or Access-Control-Request-Headers: the list of allowed headers is fixed, and a browser compares header names without regard to case. A browser can therefore send POST /payments with Content-Type application/json and an Idempotency-Key header, and can read the Idempotency-Replayed response header.
+  - field_messages (this Story): the service's wording is the reference (spec open question 1). The checkout adopts the texts in the field_messages operation and does not keep its own. If the web team finds a text unclear, the service changes it in payments/cards.py and docs/field-messages.md, this contract is updated, and both sides use the new text. Where the checkout and the service check different things (for example the service refuses control characters in the name and a name over 100 characters), the rules are not changed in this Story: the table lists the service's rules, and the web team writes any difference in its run record (spec open question 2).
+  - Delivery: the service's tasks for this Story are T1 (the message table, docs/field-messages.md, tests) and T2 (browser-style tests of cross_origin, and a fix in payments/api.py for whatever falls short). Today's code already sends the headers above, so T2 is expected to confirm the behaviour; the operations above are the contract even where the code differs, and the code is fixed to match.
   - Payment provider (spec open question 1): none. Payments run in test mode and the outcome comes from the card number as in the test_cards operation. A processing_error decline is temporary and the order stays payable.
   - Amount (open question 2): the caller passes the amount and the service charges it as sent. The service does not check it against an order record. The service does not keep orders; an order is "paid" when one of its attempts succeeded. A different amount or currency for an order that is already paid is still refused as order_already_paid.
   - Money: amount is an integer in minor units, never a float. Currency is explicit on every payment (open question 4). The service does not check that the currency has two decimal places.

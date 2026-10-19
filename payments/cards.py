@@ -21,6 +21,41 @@ NAME_MAX_LENGTH = 100
 FIELDS = ("cardholder_name", "number", "expiry", "security_code")
 
 
+# Every card-check message the service returns, in one table: the reference
+# wording for the checkout (docs/field-messages.md lists the same texts and the
+# rules behind them; a test keeps the two equal). Keys are (field, code,
+# variant). The variant is None except for the security code length message,
+# which depends on the card brand:
+#   "amex"          the number starts like an American Express card
+#   "other_brands"  any other brand found from the number, including a number
+#                   that passes the check but starts like no known brand
+#   "brand_unknown" the number is missing or malformed, so no brand is known
+VARIANT_AMEX = "amex"
+VARIANT_OTHER_BRANDS = "other_brands"
+VARIANT_BRAND_UNKNOWN = "brand_unknown"
+
+FIELD_MESSAGES: dict[tuple[str, str, Optional[str]], str] = {
+    ("cardholder_name", "required", None): "Enter the name on the card.",
+    ("cardholder_name", "invalid_format", None): "Enter the name on the card, up to %d characters." % NAME_MAX_LENGTH,
+    ("number", "required", None): "Enter your card number.",
+    ("number", "invalid_format", None): "Enter the card number using digits only, 12 to 19 of them. Spaces and dashes are fine.",
+    ("number", "invalid_number", None): "This card number is not valid. Check it and try again.",
+    ("expiry", "required", None): "Enter the expiry date, month and year.",
+    ("expiry", "invalid_format", None): "Enter a valid expiry date, month 1 to 12 and a year such as 2030.",
+    ("expiry", "expired", None): "This card has expired. Check the expiry date or use another card.",
+    ("security_code", "required", None): "Enter the security code from your card.",
+    ("security_code", "invalid_format", None): "The security code has digits only.",
+    ("security_code", "invalid_length", VARIANT_AMEX): "Enter the 4-digit security code from the front of your American Express card.",
+    ("security_code", "invalid_length", VARIANT_OTHER_BRANDS): "Enter the 3-digit security code from the back of your card.",
+    ("security_code", "invalid_length", VARIANT_BRAND_UNKNOWN): "The security code has 3 or 4 digits.",
+}
+
+
+def field_error(field: str, code: str, variant: Optional[str] = None) -> "FieldError":
+    """A FieldError whose message is taken from FIELD_MESSAGES."""
+    return FieldError(field, code, FIELD_MESSAGES[(field, code, variant)])
+
+
 @dataclass(frozen=True)
 class FieldError:
     """One invalid field. `field` is one of FIELDS; `code` is one of required,
@@ -105,37 +140,25 @@ def expected_security_code_length(brand: str) -> int:
 def _check_name(card: Mapping[str, Any]) -> Optional[FieldError]:
     name = card.get("cardholder_name")
     if name is None or (isinstance(name, str) and name.strip() == ""):
-        return FieldError("cardholder_name", "required", "Enter the name on the card.")
+        return field_error("cardholder_name", "required")
     if (
         not isinstance(name, str)
         or len(name.strip()) > NAME_MAX_LENGTH
         or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)
     ):
-        return FieldError(
-            "cardholder_name",
-            "invalid_format",
-            "Enter the name on the card, up to %d characters." % NAME_MAX_LENGTH,
-        )
+        return field_error("cardholder_name", "invalid_format")
     return None
 
 
 def _check_number(card: Mapping[str, Any]) -> Optional[FieldError]:
     raw = card.get("number")
     if raw is None or (isinstance(raw, str) and normalize_number(raw).strip() == ""):
-        return FieldError("number", "required", "Enter your card number.")
+        return field_error("number", "required")
     digits = normalize_number(raw)
     if digits is None or not _is_digits(digits) or not NUMBER_MIN_DIGITS <= len(digits) <= NUMBER_MAX_DIGITS:
-        return FieldError(
-            "number",
-            "invalid_format",
-            "Enter the card number using digits only, 12 to 19 of them. Spaces and dashes are fine.",
-        )
+        return field_error("number", "invalid_format")
     if not luhn_valid(digits):
-        return FieldError(
-            "number",
-            "invalid_number",
-            "This card number is not valid. Check it and try again.",
-        )
+        return field_error("number", "invalid_number")
     return None
 
 
@@ -147,39 +170,35 @@ def _check_expiry(card: Mapping[str, Any], today: datetime.date) -> Optional[Fie
     month = card.get("expiry_month")
     year = card.get("expiry_year")
     if month is None or year is None:
-        return FieldError("expiry", "required", "Enter the expiry date, month and year.")
+        return field_error("expiry", "required")
     if not _is_int(month) or not _is_int(year) or not 1 <= month <= 12:
-        return FieldError("expiry", "invalid_format", "Enter a valid expiry date, month 1 to 12 and a year such as 2030.")
+        return field_error("expiry", "invalid_format")
     if 0 <= year <= 99:
         year += 2000
     elif not 1000 <= year <= 9999:
-        return FieldError("expiry", "invalid_format", "Enter a valid expiry date, month 1 to 12 and a year such as 2030.")
+        return field_error("expiry", "invalid_format")
     # A card is good through the last day of its expiry month.
     if (year, month) < (today.year, today.month):
-        return FieldError("expiry", "expired", "This card has expired. Check the expiry date or use another card.")
+        return field_error("expiry", "expired")
     return None
 
 
 def _check_security_code(card: Mapping[str, Any], brand: Optional[str]) -> Optional[FieldError]:
     code = card.get("security_code")
     if code is None or code == "":
-        return FieldError("security_code", "required", "Enter the security code from your card.")
+        return field_error("security_code", "required")
     if not isinstance(code, str) or not _is_digits(code):
-        return FieldError("security_code", "invalid_format", "The security code has digits only.")
+        return field_error("security_code", "invalid_format")
     if brand is None:
         # The number is missing or malformed, so the brand is not known:
         # accept either length rather than blame this field for the number.
         ok = len(code) in (3, 4)
-        message = "The security code has 3 or 4 digits."
+        variant = VARIANT_BRAND_UNKNOWN
     else:
-        expected = expected_security_code_length(brand)
-        ok = len(code) == expected
-        if brand == "amex":
-            message = "Enter the 4-digit security code from the front of your American Express card."
-        else:
-            message = "Enter the 3-digit security code from the back of your card."
+        ok = len(code) == expected_security_code_length(brand)
+        variant = VARIANT_AMEX if brand == "amex" else VARIANT_OTHER_BRANDS
     if not ok:
-        return FieldError("security_code", "invalid_length", message)
+        return field_error("security_code", "invalid_length", variant)
     return None
 
 

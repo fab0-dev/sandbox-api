@@ -99,6 +99,11 @@ def make_handler(service: PaymentService, quiet: bool = False) -> type[BaseHTTPR
             # Errors found by http.server itself (bad request line, unsupported
             # method, header too large) get the standard body too.
             self.close_connection = True
+            if self.request_version == "HTTP/0.9":
+                # The request line was not understood (http.server leaves its
+                # version at 0.9), and an 0.9 answer has no status line and no
+                # headers, so no CORS headers either. Answer in plain HTTP/1.0.
+                self.request_version = "HTTP/1.0"
             if code == 501:  # a method http.server has no handler for
                 code, message = 405, "This method is not accepted."
             known = {400: "invalid_request", 404: "not_found", 405: "method_not_allowed"}
