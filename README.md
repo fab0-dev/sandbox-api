@@ -56,7 +56,7 @@ Refusals try no payment and record nothing. When several apply, the first of thi
 |---|---|---|
 | `invalid_request` | 400 | body is not a JSON object, `order_reference` or `currency` missing or malformed, `Idempotency-Key` empty or over 255 characters |
 | `invalid_amount` | 422 | `amount` missing, not an integer or not greater than 0 |
-| `validation_failed` | 422 | invalid card; `error.fields` lists every invalid field (`cardholder_name`, `number`, `expiry`, `security_code`) with a `code` and a `message` |
+| `validation_failed` | 422 | invalid card; `error.fields` lists every invalid field (`cardholder_name`, `number`, `expiry`, `security_code`) with a `code` and a `message` (the texts are in [docs/field-messages.md](docs/field-messages.md)) |
 | `idempotency_key_reused` | 422 | the key was used for a different request |
 | `order_already_paid` | 409 | the order has a succeeded payment; `error.order_reference` names it |
 
@@ -80,6 +80,10 @@ Query: `outcome` (`succeeded` or `declined`), `limit` (1 to 500, default 100), `
 ## Test cards
 
 The card numbers that give each outcome and each decline reason are in [docs/test-cards.md](docs/test-cards.md). For example `4242 4242 4242 4242` succeeds and `4000 0000 0000 9995` is declined for insufficient funds.
+
+## Field messages
+
+The customer messages for every card-check mistake, by field and code, with the rules behind them, are in [docs/field-messages.md](docs/field-messages.md). They are the reference wording: the web checkout shows the same texts for the same mistakes. The table lives in `payments/cards.py` and a test keeps the document equal to it.
 
 ## Card data
 
