@@ -2,6 +2,7 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import threading
 import time
 import unittest
@@ -328,6 +329,258 @@ class RoutingApiTest(ApiCase):
 
     def test_unsupported_methods_get_the_standard_body(self):
         self.assertError(self.call("TRACE", "/payments"), 405, "method_not_allowed")
+
+
+class CrossOriginApiTest(ApiCase):
+    """What a browser sends from another origin, and what it needs back (D1, D9)."""
+
+    ORIGIN = "http://checkout.example:3000"
+    PAY = "/payments"
+    STATUS = "/orders/ord_1/payments"
+
+    def browser(self, method, path, payload=None, headers=None, raw=None, origin=None):
+        sent = {"Origin": origin or self.ORIGIN}
+        sent.update(headers or {})
+        return self.call(method, path, payload, sent, raw=raw)
+
+    def preflight(self, path, method="POST", request_headers="content-type,idempotency-key", origin=None):
+        sent = {}
+        if method is not None:
+            sent["Access-Control-Request-Method"] = method
+        if request_headers is not None:
+            sent["Access-Control-Request-Headers"] = request_headers
+        return self.browser("OPTIONS", path, headers=sent, origin=origin)
+
+    def assertOnce(self, response, name, value):
+        self.assertEqual(response.headers.get_all(name), [value], name)
+
+    def assertAnswerForBrowser(self, response, replayed=False):
+        self.assertOnce(response, "Access-Control-Allow-Origin", "*")
+        self.assertOnce(response, "Access-Control-Expose-Headers", "Idempotency-Replayed")
+        self.assertIsNone(response.headers.get("Access-Control-Allow-Credentials"))
+        if replayed:
+            self.assertOnce(response, "Idempotency-Replayed", "true")
+        else:
+            self.assertIsNone(response.headers.get("Idempotency-Replayed"))
+
+    def assertPreflight(self, response):
+        self.assertEqual(response.status, 204)
+        self.assertEqual(response.raw_body, b"")
+        self.assertOnce(response, "Access-Control-Allow-Origin", "*")
+        self.assertOnce(response, "Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.assertOnce(response, "Access-Control-Allow-Headers", "Content-Type, Idempotency-Key")
+        self.assertOnce(response, "Access-Control-Max-Age", "600")
+        self.assertOnce(response, "Access-Control-Expose-Headers", "Idempotency-Replayed")
+        self.assertIsNone(response.headers.get("Access-Control-Allow-Credentials"))
+
+    def assertBrowserWouldProceed(self, response, method, request_headers):
+        """The check a browser makes on a preflight answer before the real request."""
+        self.assertTrue(200 <= response.status < 300)
+        self.assertIn(response.headers["Access-Control-Allow-Origin"], ("*", self.ORIGIN))
+        allowed_methods = {m.strip() for m in response.headers["Access-Control-Allow-Methods"].split(",")}
+        self.assertIn(method, allowed_methods)
+        allowed = {h.strip().lower() for h in response.headers["Access-Control-Allow-Headers"].split(",")}
+        for name in request_headers.split(","):
+            self.assertIn(name.strip().lower(), allowed)
+
+    def broken_status_server(self):
+        class BrokenStore:
+            def attempts_for_order(self, order_reference):
+                raise RuntimeError("store exploded")
+
+        server = make_server(PaymentService(BrokenStore(), process_card), "127.0.0.1", 0, quiet=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+        self.addCleanup(stop)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        self.addCleanup(conn.close)
+        return conn
+
+    # -- the preflight -----------------------------------------------------
+
+    def test_preflight_for_pay_order_as_a_browser_sends_it(self):
+        response = self.preflight(self.PAY, "POST", "content-type,idempotency-key")
+        self.assertPreflight(response)
+        self.assertBrowserWouldProceed(response, "POST", "content-type,idempotency-key")
+
+    def test_preflight_for_order_status_as_a_browser_sends_it(self):
+        for path in (self.STATUS, "/orders/ord%2F1%20x/payments"):
+            with self.subTest(path=path):
+                response = self.preflight(path, "GET", "content-type,idempotency-key")
+                self.assertPreflight(response)
+                self.assertBrowserWouldProceed(response, "GET", "content-type,idempotency-key")
+
+    def test_requested_headers_in_any_case_order_and_spacing(self):
+        for requested in ("content-type,idempotency-key", "idempotency-key,content-type",
+                          "Content-Type, Idempotency-Key", "IDEMPOTENCY-KEY , CONTENT-TYPE",
+                          "Idempotency-Key", "content-type", "Idempotency-key,Content-type"):
+            for path, method in ((self.PAY, "POST"), (self.STATUS, "GET")):
+                with self.subTest(requested=requested, path=path):
+                    response = self.preflight(path, method, requested)
+                    self.assertPreflight(response)
+                    self.assertBrowserWouldProceed(response, method, requested)
+
+    def test_the_preflight_answer_does_not_depend_on_what_is_requested(self):
+        for method, requested in ((None, None), ("PUT", "x-other"), ("post", "content-type"), ("DELETE", "")):
+            for path in (self.PAY, self.STATUS):
+                with self.subTest(method=method, requested=requested, path=path):
+                    self.assertPreflight(self.preflight(path, method, requested))
+
+    def test_the_preflight_answers_for_any_origin(self):
+        for origin in ("http://localhost:5173", "https://shop.example", "null", "http://127.0.0.1:3000"):
+            with self.subTest(origin=origin):
+                self.assertPreflight(self.preflight(self.PAY, origin=origin))
+
+    def test_the_preflight_ignores_a_body_and_a_query(self):
+        response = self.browser("OPTIONS", "/payments?x=1", raw="not json", headers={
+            "Access-Control-Request-Method": "POST"})
+        self.assertPreflight(response)
+
+    def test_the_preflight_is_repeatable_on_one_connection(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(conn.close)
+        for _ in range(3):
+            conn.request("OPTIONS", self.PAY, headers={
+                "Origin": self.ORIGIN, "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,idempotency-key"})
+            self.assertPreflight(Response(conn.getresponse()))
+
+    def test_the_preflight_on_an_unknown_path_is_404_with_the_origin_header(self):
+        response = self.preflight("/nope", "POST")
+        self.assertError(response, 404, "not_found")
+        self.assertAnswerForBrowser(response)
+
+    def test_the_preflight_records_nothing_and_charges_nothing(self):
+        self.preflight(self.PAY)
+        self.preflight(self.STATUS, "GET")
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.store.list_payments().payments, [])
+
+    # -- every answer to a real request -------------------------------------
+
+    def test_every_answer_to_pay_order_carries_the_headers(self):
+        answers = []
+        first = self.browser("POST", self.PAY, body(order="ord_ok"), {"Idempotency-Key": "k-1"})
+        self.assertEqual(first.status, 201)
+        answers.append((first, False))
+        replay = self.browser("POST", self.PAY, body(order="ord_ok"), {"Idempotency-Key": "k-1"})
+        self.assertEqual(replay.status, 200)
+        answers.append((replay, True))
+        declined = self.browser("POST", self.PAY, body(order="ord_dec", number="4000000000000002"))
+        self.assertEqual((declined.status, declined.json["payment"]["outcome"]), (201, "declined"))
+        answers.append((declined, False))
+        for label, response, status, code in (
+            ("409", self.browser("POST", self.PAY, body(order="ord_ok")), 409, "order_already_paid"),
+            ("422 fields", self.browser("POST", self.PAY, body(order="o2", number="4242424242424241")), 422,
+             "validation_failed"),
+            ("422 amount", self.browser("POST", self.PAY, body(order="o3", amount=0)), 422, "invalid_amount"),
+            ("422 key", self.browser("POST", self.PAY, body(order="ord_ok", amount=1), {"Idempotency-Key": "k-1"}),
+             422, "idempotency_key_reused"),
+            ("400 json", self.browser("POST", self.PAY, raw="{"), 400, "invalid_request"),
+            ("400 shape", self.browser("POST", self.PAY, body(currency="usd")), 400, "invalid_request"),
+            ("400 big", self.browser("POST", self.PAY, raw="1" * 70000), 400, "invalid_request"),
+            ("405", self.browser("PUT", self.PAY, {"x": 1}), 405, "method_not_allowed"),
+            ("404", self.browser("POST", "/payment", body()), 404, "not_found"),
+        ):
+            with self.subTest(label):
+                self.assertError(response, status, code)
+                answers.append((response, False))
+        for response, replayed in answers:
+            with self.subTest(status=response.status, replayed=replayed):
+                self.assertAnswerForBrowser(response, replayed)
+
+    def test_every_answer_to_pay_order_with_a_failing_service_carries_the_headers(self):
+        def broken(number):
+            raise RuntimeError("provider exploded")
+
+        server = make_server(PaymentService(self.store, broken), "127.0.0.1", 0, quiet=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        self.addCleanup(conn.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            conn.request("POST", "/payments", json.dumps(body()),
+                         {"Content-Type": "application/json", "Origin": self.ORIGIN, "Idempotency-Key": "k"})
+            response = Response(conn.getresponse())
+        self.assertError(response, 500, "internal_error")
+        self.assertAnswerForBrowser(response)
+
+    def test_every_answer_to_order_status_carries_the_headers(self):
+        self.browser("POST", self.PAY, body(order="ord_1"))
+        for label, response, status in (
+            ("paid", self.browser("GET", self.STATUS), 200),
+            ("unknown order", self.browser("GET", "/orders/nobody/payments"), 200),
+            ("405", self.browser("POST", self.STATUS, {"x": 1}), 405),
+            ("405 delete", self.browser("DELETE", self.STATUS), 405),
+            ("404", self.browser("GET", "/orders/ord_1/payment"), 404),
+        ):
+            with self.subTest(label):
+                self.assertEqual(response.status, status)
+                self.assertAnswerForBrowser(response)
+        self.assertTrue(self.browser("GET", self.STATUS).json["paid"])
+
+    def test_a_failing_order_status_is_500_with_the_headers(self):
+        conn = self.broken_status_server()
+        with contextlib.redirect_stderr(io.StringIO()):
+            conn.request("GET", self.STATUS, headers={"Origin": self.ORIGIN})
+            response = Response(conn.getresponse())
+        self.assertError(response, 500, "internal_error")
+        self.assertAnswerForBrowser(response)
+
+    def test_list_payments_and_its_refusals_carry_the_headers_too(self):
+        self.browser("POST", self.PAY, body())
+        for path, status in (("/payments", 200), ("/payments?outcome=declined", 200), ("/payments?limit=0", 400)):
+            with self.subTest(path=path):
+                response = self.browser("GET", path)
+                self.assertEqual(response.status, status)
+                self.assertAnswerForBrowser(response)
+
+    def test_answers_carry_the_headers_without_an_origin_header_too(self):
+        # A same-origin or non-browser caller gets the same answer.
+        self.assertAnswerForBrowser(self.call("GET", self.STATUS))
+        self.assertAnswerForBrowser(self.pay(body()))
+
+    def test_errors_found_by_the_server_itself_carry_the_headers(self):
+        for label, raw in (("bad request line", b"GET /payments HTTP/x.y\r\n\r\n"),
+                           ("header too large", b"GET /payments HTTP/1.1\r\nHost: x\r\nX: " + b"a" * 70000 + b"\r\n\r\n")):
+            with self.subTest(label):
+                with socket.create_connection(("127.0.0.1", self.port), timeout=10) as conn:
+                    conn.sendall(raw)
+                    reply = http.client.HTTPResponse(conn)
+                    reply.begin()
+                    response = Response(reply)
+                self.assertEqual(response.status // 100, 4)
+                self.assertAnswerForBrowser(response)
+
+    def test_the_replay_header_is_exposed_so_script_can_read_it(self):
+        pay = body(number="4000000000000002")
+        first = self.browser("POST", self.PAY, pay, {"Idempotency-Key": "k-replay"})
+        again = self.browser("POST", self.PAY, pay, {"Idempotency-Key": "k-replay"})
+        self.assertEqual((first.status, again.status), (201, 200))
+        exposed = {h.strip().lower() for h in again.headers["Access-Control-Expose-Headers"].split(",")}
+        self.assertIn("idempotency-replayed", exposed)
+        self.assertEqual(again.headers["Idempotency-Replayed"], "true")
+        self.assertEqual(again.json, first.json)
+        self.assertEqual(len(self.store.attempts_for_order("ord_1")), 1)
+
+    def test_a_whole_browser_exchange_preflight_then_request_then_replay(self):
+        requested = "content-type,idempotency-key"
+        pre = self.preflight(self.PAY, "POST", requested)
+        self.assertPreflight(pre)
+        self.assertBrowserWouldProceed(pre, "POST", requested)
+        first = self.browser("POST", self.PAY, body(), {"Idempotency-Key": "k-flow"})
+        again = self.browser("POST", self.PAY, body(), {"Idempotency-Key": "k-flow"})
+        self.assertAnswerForBrowser(first)
+        self.assertAnswerForBrowser(again, replayed=True)
+        self.assertEqual(again.json, first.json)
+        status = self.browser("GET", self.STATUS)
+        self.assertAnswerForBrowser(status)
+        self.assertEqual(len(status.json["payments"]), 1)
 
 
 class InternalErrorApiTest(ApiCase):
