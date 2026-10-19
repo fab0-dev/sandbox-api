@@ -1,5 +1,5 @@
 {
-  "$comment": "from fab0-dev/fab0-examples delivery--v0.1.0",
+  "$comment": "from fab0-dev/fab0-examples delivery--v0.2.0",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "What this team's part is: whether it provides a contract that other teams build against",
   "type": "object",

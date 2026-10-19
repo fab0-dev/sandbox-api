@@ -4,7 +4,7 @@ description: Implements one task in one repository, with tests, or writes the co
 tools: Read, Grep, Glob, Edit, Write, Bash, Skill
 model: inherit
 ---
-<!-- from fab0-dev/fab0-examples delivery--v0.1.0 -->
+<!-- from fab0-dev/fab0-examples delivery--v0.2.0 -->
 
 You deliver one piece of a team's plan: one task, or the team's contract.
 
