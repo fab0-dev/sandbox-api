@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# from fab0-dev/fab0-examples delivery--v0.1.0
+# from fab0-dev/fab0-examples delivery--v0.2.0
 """The merge guard: a Claude Code PreToolUse hook on Bash. It blocks commands the model issues that would merge
-a pull request, push to the base branch, or force-push. fab0's `apply` merges what a gate allows, through its own
-git calls, and people merge on GitHub; neither passes through this hook.
+a pull request, push to the base branch, or force-push. Merge authority is the gates' and the merge policy's:
+`fab0-resolve apply` merges what they allow, through its own git and GitHub calls, and a person merges where a gate
+is `human` and the policy leaves the merge to them. Neither passes through this hook.
 
 The base branch is `git.base` in .fab0/fab0.yaml (default `main`). Exit 2 blocks the command and tells the model
 why; exit 0 lets it run.
@@ -43,9 +44,9 @@ def segments(command: str) -> list[list[str]]:
 
 def why_blocked(words: list[str], base: str) -> str | None:
     if words[0] == "gh" and words[1:3] == ["pr", "merge"]:
-        return "merging a pull request is a person's decision, or `fab0-resolve apply`'s within the merge policy"
+        return "merging a pull request is `fab0-resolve apply`'s, as its gate and git.auto_merge allow, or a person's"
     if words[0] == "gh" and len(words) > 1 and words[1] == "api" and any(re.search(r"/merges?\b", w) for w in words):
-        return "merging through the API is a person's decision, or `fab0-resolve apply`'s"
+        return "merging through the API is `fab0-resolve apply`'s, as its gate and git.auto_merge allow, or a person's"
     if words[0] != "git" or "push" not in words:
         return None
     args = words[words.index("push") + 1 :]
@@ -56,7 +57,7 @@ def why_blocked(words: list[str], base: str) -> str | None:
             return "nothing in a fab0 project is force-pushed"
         target = arg.split(":")[-1].removeprefix("refs/heads/")
         if target == base and not arg.startswith("-"):
-            return f"nothing is pushed to {base} directly; a person merges the run's pull request"
+            return f"nothing is pushed to {base} directly; the run's pull request merges as git.auto_merge allows"
     return None
 
 

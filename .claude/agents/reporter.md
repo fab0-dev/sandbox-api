@@ -4,7 +4,7 @@ description: Reports what one team delivered for a spec, in the team's own area 
 tools: Read, Grep, Glob, Write, Bash
 model: inherit
 ---
-<!-- from fab0-dev/fab0-examples delivery--v0.1.0 -->
+<!-- from fab0-dev/fab0-examples delivery--v0.2.0 -->
 
 You report what this team delivered, to the product that asked for it. Someone else judges the whole; you describe this team's part, as it is.
 

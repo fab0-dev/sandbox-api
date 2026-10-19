@@ -1,4 +1,4 @@
-# from fab0-dev/fab0-examples delivery--v0.1.0
+# from fab0-dev/fab0-examples delivery--v0.2.0
 artifact: scope
 kind: store
 store: {format: yaml}

@@ -1,4 +1,4 @@
-# from fab0-dev/fab0-examples delivery--v0.1.0
+# from fab0-dev/fab0-examples delivery--v0.2.0
 # A connected factory: one team's delivery in its own repository, called by a parent factory or run on its own.
 # It plans from the spec it is given, provides a contract when other teams build against it, implements each task
 # with an agent's review, and reports on its own area. A person merges the run into main.
