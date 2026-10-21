@@ -1,5 +1,5 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 artifact: scope
-kind: store
-store: {format: yaml}
+kind: file
+file: {repo: runs, path: "runs/sandbox-api/{run}/scope.yaml", format: yaml}
 schema: .fab0/schemas/scope.json

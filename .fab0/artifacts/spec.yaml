@@ -1,4 +1,5 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
+# What the caller binds, read where it wrote it; a run started by hand reads its item instead.
 artifact: spec
-kind: store
-store: {format: markdown}
+kind: file
+file: {format: markdown}

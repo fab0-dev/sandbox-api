@@ -1,11 +1,17 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 # A connected factory: one team's delivery in its own repository, called by a parent factory or run on its own.
-# It plans from the spec it is given, provides a contract when other teams build against it, implements each task
-# with an agent's review, and reports on its own area. A person merges the run into main.
-schema: 2
+# It plans from the spec it is given, which its developer confirms at the prompt, provides a contract when other
+# teams build against it, implements each task with an agent's review, reports on its own area, and merges the
+# run into main once its checks pass.
+schema: 3
 repos:
   # EDIT: this repository, as the parent's `factories` names it, and any other repository tasks may change.
+  # The organisation and this repository's name are placeholders everywhere in .fab0/, as the README says: the
+  # repository's name is the factory's name.
   home: {path: ., github: fab0-dev/sandbox-api, owner: developer}
+  # EDIT: the parent's runs repository, a sibling checkout, which every factory of the product shares: the plan,
+  # the contract and the report are files there, and the tracker's issues of every run.
+  runs: {path: ../sandbox-runs, github: fab0-dev/sandbox-runs}
 people:
   # EDIT: the GitHub users in each role.
   developer: {github: [eugenefurs]}
@@ -17,11 +23,11 @@ tracker:
 git:
   base: main
   branching: run
-  auto_merge: {into: [run]}
+  # A child run has its caller's run id: its branches in the shared runs repository carry this factory's name.
+  branches: {run: "sandbox-api/{run}/base", unit: "sandbox-api/{run}/{unit}"}
 parallel: {max: 3, cross_run: warn}
-# EDIT: the parent's runs repository. This factory keeps its runs there under its own project, by default this
-# repository's name.
-store: {github: fab0-dev/sandbox-runs}
+# The run tracker, the parent's: a call opens this factory's Pipeline Run under the caller's.
+tracking: {kind: github, github: fab0-dev/sandbox-runs}
 models:
   claude-code: {deep: opus, balanced: sonnet, fast: haiku}
 profiles:

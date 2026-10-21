@@ -1,9 +1,10 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 step: report
 agent: reporter
 model: balanced
 inputs: [spec, upstream, tasks]
 outputs: [feedback]
-repos: {read: [all]}
+repos: {write: [runs], read: [all]}
+paths: ["runs/sandbox-api/{run}/feedback.md"]
 return: {questions: optional}
 owner: developer

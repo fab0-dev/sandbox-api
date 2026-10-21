@@ -1,11 +1,11 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 step: contract
 agent: implementer
 model: balanced
 instructions: Write the contract other teams build against, from the spec and the task list. Implement nothing yet.
 inputs: [spec, upstream, tasks, reviews]
 outputs: [contract]
-repos: {write: [home], read: [all]}
-paths: [contract.yaml]
+repos: {write: [runs], read: [all]}
+paths: ["runs/sandbox-api/{run}/contract.yaml"]
 return: {questions: optional}
 owner: developer

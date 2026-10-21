@@ -1,6 +1,6 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 artifact: tasks
-kind: store
-store: {format: yaml}
+kind: file
+file: {repo: runs, path: "runs/sandbox-api/{run}/tasks.yaml", format: yaml}
 schema: .fab0/schemas/tasks.json
 elements: {id: id, title: title, after: depends_on, paths: files}

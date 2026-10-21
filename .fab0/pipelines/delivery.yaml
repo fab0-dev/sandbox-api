@@ -1,6 +1,6 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 pipeline: delivery
-# A call makes the item, with this label, as a sub-issue of the caller's item. A person may add it by hand too.
+# A caller's call opens the run, with no item; a person may start one by hand on an item with this label.
 trigger: {issue: {label: delivery}}
 inputs:
   spec: {default: request} # a caller's spec, or the item's own body when the run is started by hand
@@ -10,24 +10,29 @@ onStart:
   - git.run-branch
   - pr.open-run: {draft: true}
 steps:
-  # The task list, and whether this team provides a contract, reviewed in a pull request of the runs repository.
+  # The task list, and whether this team provides a contract: the developer confirms them in the run session, or
+  # rejects them with what to change.
   - step: plan
-    gate: {human: {owner: developer}}
+    gate: {human: {owner: developer, via: prompt}}
+    done: {issue: {status: Done}}
   - when: {artifact: scope, path: contract, equals: true}
     steps:
       - step: contract
-        gate: {auto: {agent: reviewer, model: deep}, merge: auto, retry: 2, then: human}
+        gate: {auto: {agent: reviewer, model: deep}, retry: 2, then: human}
+        done: {issue: {status: Done}}
   - foreach: tasks
     id: tasks
     onStart:
       - tracker.child.sync: {type: Task, title: "{unit.title}"}
     steps:
       - step: implement
-        gate: {auto: {agent: reviewer, model: deep}, merge: auto, retry: 2, then: human}
+        gate: {auto: {agent: reviewer, model: deep}, retry: 2, then: human}
+        done: {issue: {status: Done}}
     onEnd:
       - tracker.child.close: {type: Task}
   # What this team delivered, about its own area only: the caller judges the whole.
   - step: report
+    done: {issue: {status: Done}}
 onEnd:
   - git.sync-base
-  - pr.ready # a person merges the run; pr.merge in its place merges it, when git.auto_merge allows the base
+  - pr.merge # each run pull request into main, once its required checks pass

@@ -1,6 +1,6 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 artifact: feedback
-kind: store
-store: {format: markdown}
+kind: file
+file: {repo: runs, path: "runs/sandbox-api/{run}/feedback.md", format: markdown}
 verify:
   - sections: [Delivered, Deviations, Open questions]
