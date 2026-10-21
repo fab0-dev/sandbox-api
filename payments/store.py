@@ -8,6 +8,13 @@ digits, so a full number cannot be passed in by mistake.
 Lists are newest first by `created_at`, ties broken by the later attempt
 first. Times are UTC, to the second, written like 2026-10-18T14:03:22Z.
 
+A payment is refunded at most once, in full: the `refunds` table has the payment
+reference as its primary key, so a second refund cannot be written, however
+the callers race. A refund copies the payment's own amount and currency inside
+the same statement that writes it, and a trigger refuses a refund that does not
+match a succeeded payment. Every `Payment` read from the store carries its
+refund, or None. A refund holds no card data.
+
 One `PaymentStore` shares a single connection between threads and guards it
 with a lock, so it can sit behind a threaded HTTP server.
 """
@@ -31,6 +38,7 @@ OUTCOMES = (SUCCEEDED, DECLINED)
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 500
+MAX_REASON_LENGTH = 500
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS payments (
@@ -54,11 +62,49 @@ CREATE INDEX IF NOT EXISTS payments_by_outcome ON payments (outcome, created_at,
 -- a caller forgets to check first.
 CREATE UNIQUE INDEX IF NOT EXISTS payments_one_success_per_order
     ON payments (order_reference) WHERE outcome = 'succeeded';
+
+-- A payment is refunded at most once: the payment reference is the key. The
+-- refund is the payment's whole amount in its currency, and only a succeeded
+-- payment has one. A refund is never changed or removed.
+CREATE TABLE IF NOT EXISTS refunds (
+    payment_reference TEXT    NOT NULL PRIMARY KEY REFERENCES payments (payment_reference),
+    amount            INTEGER NOT NULL CHECK (amount > 0),
+    currency          TEXT    NOT NULL CHECK (length(currency) = 3),
+    reason            TEXT    NOT NULL CHECK (trim(reason) <> ''),
+    refunded_at       TEXT    NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS refunds_match_a_succeeded_payment
+BEFORE INSERT ON refunds
+WHEN NOT EXISTS (
+    SELECT 1 FROM payments
+    WHERE payments.payment_reference = NEW.payment_reference
+      AND payments.outcome = 'succeeded'
+      AND payments.amount = NEW.amount
+      AND payments.currency = NEW.currency
+)
+BEGIN
+    SELECT RAISE(ABORT, 'refund does not match a succeeded payment');
+END;
+CREATE TRIGGER IF NOT EXISTS refunds_are_not_updated
+BEFORE UPDATE ON refunds
+BEGIN
+    SELECT RAISE(ABORT, 'a refund is not changed');
+END;
+CREATE TRIGGER IF NOT EXISTS refunds_are_not_deleted
+BEFORE DELETE ON refunds
+BEGIN
+    SELECT RAISE(ABORT, 'a refund is not removed');
+END;
 """
 
+# Columns of a payment (the first eleven, `seq` first) and of its refund, from
+# `payments p LEFT JOIN refunds r`. The refund columns are all NULL for a
+# payment that was not refunded.
+_FROM = "payments p LEFT JOIN refunds r ON r.payment_reference = p.payment_reference"
 _COLUMNS = (
-    "seq, payment_reference, order_reference, amount, currency, outcome, "
-    "decline_reason, message, brand, last4, created_at"
+    "p.seq, p.payment_reference, p.order_reference, p.amount, p.currency, p.outcome, "
+    "p.decline_reason, p.message, p.brand, p.last4, p.created_at, "
+    "r.amount, r.currency, r.reason, r.refunded_at"
 )
 
 
@@ -70,8 +116,51 @@ class OrderAlreadyPaid(Exception):
         self.order_reference = order_reference
 
 
+class PaymentNotFound(Exception):
+    """There is no payment with this reference."""
+
+    def __init__(self, payment_reference: str):
+        super().__init__("payment not found")
+        self.payment_reference = payment_reference
+
+
+class PaymentDeclined(Exception):
+    """The payment was declined: it took no money, so there is nothing to refund."""
+
+    def __init__(self, payment_reference: str):
+        super().__init__("payment was declined")
+        self.payment_reference = payment_reference
+
+
+class PaymentAlreadyRefunded(Exception):
+    """The payment already has a refund; `refunded_at` is the time of the first one."""
+
+    def __init__(self, payment_reference: str, refunded_at: str):
+        super().__init__("payment already refunded")
+        self.payment_reference = payment_reference
+        self.refunded_at = refunded_at
+
+
 class InvalidCursor(ValueError):
     """The cursor is not one this store issued."""
+
+
+@dataclass(frozen=True)
+class Refund:
+    """The refund of a payment: always its whole amount, in its own currency."""
+
+    amount: int  # minor units, the payment's own
+    currency: str  # the payment's own
+    reason: str  # the shop's reason, as given
+    refunded_at: str  # ISO 8601 UTC with a trailing Z
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "amount": self.amount,
+            "currency": self.currency,
+            "reason": self.reason,
+            "refunded_at": self.refunded_at,
+        }
 
 
 @dataclass(frozen=True)
@@ -88,6 +177,7 @@ class Payment:
     brand: str
     last4: str
     created_at: str  # ISO 8601 UTC with a trailing Z
+    refund: Optional[Refund] = None  # None when the payment was not refunded
 
     def as_dict(self) -> dict[str, Any]:
         """The payment in the shape of the contract."""
@@ -101,6 +191,7 @@ class Payment:
             "message": self.message,
             "card": {"brand": self.brand, "last4": self.last4},
             "created_at": self.created_at,
+            "refund": None if self.refund is None else self.refund.as_dict(),
         }
 
 
@@ -126,7 +217,8 @@ def _is_ascii_digits(value: str) -> bool:
 
 
 def _row_to_payment(row: sqlite3.Row | tuple) -> Payment:
-    return Payment(*row[1:])
+    refund = None if row[11] is None else Refund(*row[11:15])
+    return Payment(*row[1:11], refund)
 
 
 def _encode_cursor(created_at: str, seq: int) -> str:
@@ -220,6 +312,56 @@ class PaymentStore:
                                decline_reason, message, brand, last4, stamp)
         raise RuntimeError("could not make a unique payment reference")
 
+    def refund_payment(
+        self,
+        payment_reference: str,
+        reason: str,
+        refunded_at: Optional[datetime.datetime] = None,
+    ) -> Payment:
+        """Refund a succeeded payment in full, once, and return it with its refund.
+
+        The refund is its whole amount in its currency, with the shop's `reason`
+        kept as given (not blank, at most 500 characters) and the time of the
+        refund (default now, UTC). The check and the write are one statement,
+        so of two or more simultaneous refunds exactly one is recorded.
+
+        Raises ValueError for a reason that does not fit, PaymentNotFound,
+        PaymentDeclined, and PaymentAlreadyRefunded (carrying the first
+        refund's time, which stays as it was). A refused refund changes nothing.
+        """
+        if not isinstance(reason, str) or reason.strip() == "":
+            raise ValueError("reason must be text that is not blank")
+        if len(reason) > MAX_REASON_LENGTH:
+            raise ValueError("reason must be at most %d characters" % MAX_REASON_LENGTH)
+        stamp = format_time(refunded_at or datetime.datetime.now(datetime.timezone.utc))
+        with self._lock:
+            try:
+                with self._conn:
+                    written = self._conn.execute(
+                        "INSERT INTO refunds (payment_reference, amount, currency, reason, refunded_at)"
+                        " SELECT payment_reference, amount, currency, ?, ? FROM payments"
+                        " WHERE payment_reference = ? AND outcome = 'succeeded'",
+                        (reason, stamp, payment_reference),
+                    ).rowcount
+            except sqlite3.IntegrityError as error:
+                if "refunds.payment_reference" not in str(error):
+                    raise
+                first = self._conn.execute(
+                    "SELECT refunded_at FROM refunds WHERE payment_reference = ?",
+                    (payment_reference,),
+                ).fetchone()
+                if first is None:  # another writer, on another connection, is not done yet
+                    raise
+                raise PaymentAlreadyRefunded(payment_reference, first[0]) from None
+            if written == 0:
+                payment = self.get_payment(payment_reference)
+                if payment is None:
+                    raise PaymentNotFound(payment_reference)
+                raise PaymentDeclined(payment_reference)
+            payment = self.get_payment(payment_reference)
+        assert payment is not None and payment.refund is not None
+        return payment
+
     @staticmethod
     def _check_attempt(order_reference, amount, currency, outcome, decline_reason, message, brand, last4) -> None:
         if not isinstance(order_reference, str) or order_reference == "":
@@ -248,8 +390,8 @@ class PaymentStore:
         """All attempts for an order, newest first; empty for an unknown order."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT " + _COLUMNS + " FROM payments WHERE order_reference = ?"
-                " ORDER BY created_at DESC, seq DESC",
+                "SELECT " + _COLUMNS + " FROM " + _FROM + " WHERE p.order_reference = ?"
+                " ORDER BY p.created_at DESC, p.seq DESC",
                 (order_reference,),
             ).fetchall()
         return [_row_to_payment(r) for r in rows]
@@ -262,6 +404,30 @@ class PaymentStore:
                 (order_reference,),
             ).fetchone()
         return row is not None
+
+    def get_payment(self, payment_reference: str) -> Optional[Payment]:
+        """The payment with this reference, with its refund; None when there is none."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT " + _COLUMNS + " FROM " + _FROM + " WHERE p.payment_reference = ?",
+                (payment_reference,),
+            ).fetchone()
+        return None if row is None else _row_to_payment(row)
+
+    def refunded_at(self, order_reference: str) -> Optional[str]:
+        """When the order was refunded (UTC, trailing Z); None when it was not."""
+        with self._lock:
+            # An order has at most one succeeded payment, so at most one refund.
+            row = self._conn.execute(
+                "SELECT r.refunded_at FROM payments p JOIN refunds r"
+                " ON r.payment_reference = p.payment_reference WHERE p.order_reference = ?",
+                (order_reference,),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def is_refunded(self, order_reference: str) -> bool:
+        """True when the order's succeeded payment was refunded."""
+        return self.refunded_at(order_reference) is not None
 
     def list_payments(
         self,
@@ -282,16 +448,16 @@ class PaymentStore:
             raise ValueError("limit must be an integer from 1 to %d" % MAX_LIMIT)
         where, args = [], []
         if outcome is not None:
-            where.append("outcome = ?")
+            where.append("p.outcome = ?")
             args.append(outcome)
         if cursor is not None:
             stamp, seq = _decode_cursor(cursor)
-            where.append("(created_at < ? OR (created_at = ? AND seq < ?))")
+            where.append("(p.created_at < ? OR (p.created_at = ? AND p.seq < ?))")
             args.extend([stamp, stamp, seq])
-        sql = "SELECT " + _COLUMNS + " FROM payments"
+        sql = "SELECT " + _COLUMNS + " FROM " + _FROM
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY created_at DESC, seq DESC LIMIT ?"
+        sql += " ORDER BY p.created_at DESC, p.seq DESC LIMIT ?"
         args.append(limit + 1)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
