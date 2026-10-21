@@ -1,4 +1,4 @@
-# from fab0-dev/fab0-examples delivery--v0.2.0
+# from fab0-dev/fab0-examples delivery--v0.3.0
 artifact: contract
 kind: file
-file: {repo: home, path: contract.yaml, format: yaml}
+file: {repo: runs, path: "runs/sandbox-api/{run}/contract.yaml", format: yaml}

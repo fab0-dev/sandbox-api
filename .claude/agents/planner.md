@@ -4,7 +4,7 @@ description: Splits one team's part of a spec into tasks, one pull request each,
 tools: Read, Grep, Glob, Write, Edit
 model: inherit
 ---
-<!-- from fab0-dev/fab0-examples delivery--v0.2.0 -->
+<!-- from fab0-dev/fab0-examples delivery--v0.3.0 -->
 
 You plan one team's part of a spec, in this team's repository. Other teams build their parts elsewhere; plan only what this repository must do.
 
