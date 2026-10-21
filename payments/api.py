@@ -1,6 +1,7 @@
 """The JSON HTTP service of the contract, on the standard library.
 
     POST /payments                          Pay order
+    POST /payments/{payment_reference}/refund  Refund payment
     GET  /orders/{order_reference}/payments Order payment status
     GET  /payments                          List payments
 
@@ -32,12 +33,19 @@ STATUS_BY_CODE = {
     "validation_failed": 422,
     "idempotency_key_reused": 422,
     "order_already_paid": 409,
+    "order_refunded": 409,
+    "reason_required": 422,
+    "reason_too_long": 422,
+    "payment_not_found": 404,
+    "payment_declined": 409,
+    "payment_already_refunded": 409,
     "not_found": 404,
     "method_not_allowed": 405,
     "internal_error": 500,
 }
 
 _ORDER_PATH = re.compile(r"/orders/([^/]+)/payments")
+_REFUND_PATH = re.compile(r"/payments/([^/]+)/refund")
 _DIGITS = re.compile(r"[0-9]+")
 
 CORS_HEADERS = {
@@ -140,10 +148,13 @@ def make_handler(service: PaymentService, quiet: bool = False) -> type[BaseHTTPR
             body = self._read_body()
             parts = urlsplit(self.path)
             order_match = _ORDER_PATH.fullmatch(parts.path)
+            refund_match = _REFUND_PATH.fullmatch(parts.path)
             if parts.path == "/payments":
                 allowed = ("GET", "POST")
             elif order_match:
                 allowed = ("GET",)
+            elif refund_match:
+                allowed = ("POST",)
             else:
                 raise Refusal("not_found", "There is nothing at this address.")
             method = self.command
@@ -157,7 +168,9 @@ def make_handler(service: PaymentService, quiet: bool = False) -> type[BaseHTTPR
                     {"Allow": ", ".join(allowed + ("OPTIONS",))},
                 )
                 return
-            if method == "POST":
+            if refund_match:
+                self._refund_payment(unquote(refund_match.group(1)), body)
+            elif method == "POST":
                 self._pay_order(body)
             elif order_match:
                 self._order_status(unquote(order_match.group(1)))
@@ -176,6 +189,19 @@ def make_handler(service: PaymentService, quiet: bool = False) -> type[BaseHTTPR
             result = service.pay_order(body, self.headers.get("Idempotency-Key"))
             headers = {"Idempotency-Replayed": "true"} if result.replayed else None
             self._send(200 if result.replayed else 201, result.body(), headers)
+
+        def _refund_payment(self, payment_reference: str, raw: Optional[bytes]) -> None:
+            if raw is None:
+                raise Refusal("invalid_request", "The request body is too large or its length is not usable.")
+            if raw == b"":
+                body: Any = {}  # no body at all: a request without a reason
+            else:
+                try:
+                    body = json.loads(raw.decode("utf-8"))
+                except (ValueError, RecursionError):
+                    raise Refusal("invalid_request", "The request body is not valid JSON.") from None
+            payment = service.refund_payment(payment_reference, body)
+            self._send(200, {"payment": payment.as_dict()})
 
         def _order_status(self, order_reference: str) -> None:
             self._send(200, service.order_status(order_reference).body())
