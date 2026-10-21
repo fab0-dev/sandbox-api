@@ -1,14 +1,20 @@
-"""Pay order, Order payment status and List payments, without any HTTP.
+"""Pay order, Refund payment, Order payment status and List payments, without any HTTP.
 
 `PaymentService` holds the rules of the contract:
 
 - a request is refused, and no payment is tried or recorded, when it is
   malformed (invalid_request), the amount is not a positive integer
   (invalid_amount), the card details are invalid (validation_failed), the
-  Idempotency-Key was used for another request (idempotency_key_reused) or the
-  order is already paid (order_already_paid), judged in that order;
+  Idempotency-Key was used for another request (idempotency_key_reused), the
+  order was refunded (order_refunded) or the order is already paid
+  (order_already_paid), judged in that order;
 - attempts are serialised per order, so two simultaneous requests for one order
   run one after the other and an order is never charged twice;
+- a refund runs under the same per-order lock, so a refund and a payment for
+  one order never interleave, and a payment is refunded at most once. It is
+  refused, changing nothing, for a missing or blank reason, a reason over 500
+  characters, an unknown payment, a declined payment or an already refunded
+  one, judged in that order;
 - a repeated Idempotency-Key with the same request returns the first answer
   without a new attempt. Only succeeded and declined answers are remembered;
 - a decline is a normal answer, not an error.
@@ -34,11 +40,15 @@ from typing import Any, Callable, Optional
 from payments.cards import FieldError, mask_card, validate_card
 from payments.processor import ProcessorResult, process_card
 from payments.store import (
+    MAX_REASON_LENGTH,
     OUTCOMES,
     InvalidCursor,
     OrderAlreadyPaid,
     Page,
     Payment,
+    PaymentAlreadyRefunded,
+    PaymentDeclined,
+    PaymentNotFound,
     PaymentStore,
 )
 
@@ -56,8 +66,10 @@ class Refusal(Exception):
     """The request is refused: no payment was tried and nothing was recorded.
 
     `code` is the contract's error code. `extra` holds the optional members of
-    the error body: `fields` (validation_failed) or `order_reference`
-    (order_already_paid).
+    the error body: `fields` (validation_failed), `order_reference`
+    (order_already_paid, order_refunded), `refunded_at` (order_refunded,
+    payment_already_refunded) or `payment_reference` (payment_not_found,
+    payment_declined, payment_already_refunded).
     """
 
     def __init__(self, code: str, message: str, **extra: Any):
@@ -82,13 +94,21 @@ class PayResult:
 @dataclass(frozen=True)
 class OrderStatus:
     order_reference: str
-    paid: bool
+    status: str  # "unpaid", "paid" or "refunded"
+    refunded_at: Optional[str]  # the refund's time when status is "refunded", else None
     payments: list[Payment]
+
+    @property
+    def paid(self) -> bool:
+        """Kept for existing readers: true only when status is "paid"."""
+        return self.status == "paid"
 
     def body(self) -> dict[str, Any]:
         return {
             "order_reference": self.order_reference,
+            "status": self.status,
             "paid": self.paid,
+            "refunded_at": self.refunded_at,
             "payments": [p.as_dict() for p in self.payments],
         }
 
@@ -255,8 +275,16 @@ class PaymentService:
         entry.done.set()
 
     def _attempt(self, order_reference, amount, currency, card, brand, last4) -> PayResult:
-        """The paid check, the payment and the record, one order at a time."""
+        """The refunded and paid checks, the payment and the record, one order at a time."""
         with self._order_locks.hold(order_reference):
+            refunded_at = self._store.refunded_at(order_reference)
+            if refunded_at is not None:
+                raise Refusal(
+                    "order_refunded",
+                    "This order was refunded, so it cannot be paid again.",
+                    order_reference=order_reference,
+                    refunded_at=refunded_at,
+                )
             if self._store.is_paid(order_reference):
                 raise _already_paid(order_reference)
             outcome = self._processor(card["number"])
@@ -278,9 +306,58 @@ class PaymentService:
     # -- Order payment status -------------------------------------------
 
     def order_status(self, order_reference: str) -> OrderStatus:
-        """Whether the order is paid, and its attempts, newest first."""
+        """Whether the order is unpaid, paid or refunded (and when), and its
+        attempts, newest first."""
         payments = self._store.attempts_for_order(order_reference)
-        return OrderStatus(order_reference, any(p.outcome == "succeeded" for p in payments), payments)
+        succeeded = next((p for p in payments if p.outcome == "succeeded"), None)
+        if succeeded is None:
+            return OrderStatus(order_reference, "unpaid", None, payments)
+        if succeeded.refund is None:
+            return OrderStatus(order_reference, "paid", None, payments)
+        return OrderStatus(order_reference, "refunded", succeeded.refund.refunded_at, payments)
+
+    # -- Refund payment --------------------------------------------------
+
+    def refund_payment(self, payment_reference: str, body: Any) -> Payment:
+        """Refund one succeeded payment in full, once, with the shop's reason.
+
+        `body` is the parsed JSON request (an empty object when the request had
+        no body at all). Returns the payment with its refund. Raises Refusal,
+        changing nothing, in the contract's order: invalid_request,
+        reason_required, reason_too_long, payment_not_found, payment_declined,
+        payment_already_refunded.
+        """
+        if not isinstance(body, dict):
+            raise Refusal("invalid_request", "The request body must be a JSON object.")
+        reason = body.get("reason")
+        if not isinstance(reason, str) or reason.strip() == "":
+            raise Refusal("reason_required", "Give the reason for the refund.")
+        if len(reason) > MAX_REASON_LENGTH:
+            raise Refusal("reason_too_long", "The reason can be at most %d characters." % MAX_REASON_LENGTH)
+        payment = self._store.get_payment(payment_reference)
+        if payment is None:
+            raise _payment_not_found(payment_reference)
+        # The order's lock, as in a payment, so the two never interleave. The
+        # store records at most one refund per payment, so of two simultaneous
+        # refunds one succeeds and the other finds the first.
+        with self._order_locks.hold(payment.order_reference):
+            try:
+                return self._store.refund_payment(payment_reference, reason)
+            except PaymentNotFound:
+                raise _payment_not_found(payment_reference) from None
+            except PaymentDeclined:
+                raise Refusal(
+                    "payment_declined",
+                    "This payment was declined, so it took no money and there is nothing to refund.",
+                    payment_reference=payment_reference,
+                ) from None
+            except PaymentAlreadyRefunded as already:
+                raise Refusal(
+                    "payment_already_refunded",
+                    "This payment was already refunded at %s." % already.refunded_at,
+                    payment_reference=payment_reference,
+                    refunded_at=already.refunded_at,
+                ) from None
 
     # -- List payments ---------------------------------------------------
 
@@ -299,6 +376,14 @@ class PaymentService:
 
 def _field_body(error: FieldError) -> dict[str, str]:
     return {"field": error.field, "code": error.code, "message": error.message}
+
+
+def _payment_not_found(payment_reference: str) -> Refusal:
+    return Refusal(
+        "payment_not_found",
+        "There is no payment with this reference.",
+        payment_reference=payment_reference,
+    )
 
 
 def _already_paid(order_reference: str) -> Refusal:

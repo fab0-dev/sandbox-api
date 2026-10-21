@@ -72,6 +72,7 @@ class PayOrderTest(ServiceCase):
         self.assertEqual(payment["card"], {"brand": "visa", "last4": "4242"})
         self.assertTrue(payment["payment_reference"].startswith("pay_"))
         self.assertTrue(payment["created_at"].endswith("Z"))
+        self.assertIsNone(payment["refund"])
         self.assertEqual(result.body(), {"payment": payment, "order_paid": True})
         self.assertTrue(self.store.is_paid("ord_1"))
 
@@ -378,7 +379,8 @@ class ConcurrencyTest(unittest.TestCase):
 class StatusAndListTest(ServiceCase):
     def test_status_of_an_unknown_order_is_unpaid_and_empty(self):
         status = self.service.order_status("nope")
-        self.assertEqual(status.body(), {"order_reference": "nope", "paid": False, "payments": []})
+        self.assertEqual(status.body(), {"order_reference": "nope", "status": "unpaid", "paid": False,
+                                         "refunded_at": None, "payments": []})
 
     def test_status_lists_attempts_newest_first(self):
         self.service.pay_order(request(number="4000000000000002"), "k1")
@@ -436,6 +438,412 @@ class NoCardDataTest(ServiceCase):
         self.assertNotIn('"%s"' % code, shown)
         columns = [row[1] for row in self.store._conn.execute("PRAGMA table_info(payments)")]
         self.assertFalse({"number", "card_number", "security_code", "cvv"} & set(columns))
+
+
+DECLINED = "4000000000000002"
+
+
+class RefundCase(ServiceCase):
+    def paid(self, order="ord_1", number=VISA_OK):
+        return self.service.pay_order(request(order=order, number=number)).payment
+
+    def refund(self, payment_reference, body):
+        return self.service.refund_payment(payment_reference, body)
+
+    def refund_refusal(self, payment_reference, body):
+        with self.assertRaises(Refusal) as caught:
+            self.service.refund_payment(payment_reference, body)
+        return caught.exception
+
+    def snapshot(self):
+        return (
+            [p.as_dict() for p in self.store.list_payments().payments],
+            "\n".join(self.store._conn.iterdump()),
+        )
+
+
+class RefundPaymentTest(RefundCase):
+    def test_a_succeeded_payment_is_refunded_in_full_with_the_reason_as_given(self):
+        payment = self.paid()
+        reason = "  Out of stock \u00e9\n"
+        refunded = self.refund(payment.payment_reference, {"reason": reason})
+        shown = refunded.as_dict()
+        self.assertEqual(shown["outcome"], "succeeded")
+        self.assertIsNone(shown["decline_reason"])
+        self.assertEqual(shown["amount"], 2599)
+        self.assertEqual(set(shown["refund"]), {"amount", "currency", "reason", "refunded_at"})
+        self.assertEqual(shown["refund"]["amount"], payment.amount)
+        self.assertEqual(shown["refund"]["currency"], payment.currency)
+        self.assertEqual(shown["refund"]["reason"], reason)
+        self.assertRegex(shown["refund"]["refunded_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        for member in ("payment_reference", "order_reference", "currency", "message", "card", "created_at"):
+            self.assertEqual(shown[member], payment.as_dict()[member])
+
+    def test_a_reason_of_500_characters_is_accepted(self):
+        payment = self.paid()
+        self.assertEqual(len(self.refund(payment.payment_reference, {"reason": "x" * 500}).refund.reason), 500)
+
+    def test_a_missing_blank_or_non_text_reason_is_refused_and_nothing_changes(self):
+        payment = self.paid()
+        before = self.snapshot()
+        for label, body in (("missing", {}), ("null", {"reason": None}), ("empty", {"reason": ""}),
+                            ("spaces", {"reason": "  \t\n "}), ("number", {"reason": 5}),
+                            ("list", {"reason": ["x"]}), ("bool", {"reason": True})):
+            with self.subTest(label):
+                refusal = self.refund_refusal(payment.payment_reference, body)
+                self.assertEqual(refusal.code, "reason_required")
+                self.assertEqual(refusal.message, "Give the reason for the refund.")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_reason_over_500_characters_is_refused_and_nothing_changes(self):
+        payment = self.paid()
+        before = self.snapshot()
+        refusal = self.refund_refusal(payment.payment_reference, {"reason": "x" * 501})
+        self.assertEqual(refusal.code, "reason_too_long")
+        self.assertEqual(refusal.message, "The reason can be at most 500 characters.")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_body_that_is_not_an_object_is_an_invalid_request(self):
+        payment = self.paid()
+        for body in (None, [], "reason", 3, [{"reason": "x"}]):
+            with self.subTest(body=body):
+                self.assertEqual(self.refund_refusal(payment.payment_reference, body).code, "invalid_request")
+        self.assertIsNone(self.store.get_payment(payment.payment_reference).refund)
+
+    def test_an_unknown_payment_is_not_found_and_nothing_is_recorded(self):
+        self.paid()
+        before = self.snapshot()
+        refusal = self.refund_refusal("pay_nope", {"reason": "Out of stock"})
+        self.assertEqual(refusal.code, "payment_not_found")
+        self.assertEqual(refusal.message, "There is no payment with this reference.")
+        self.assertEqual(refusal.extra, {"payment_reference": "pay_nope"})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_declined_payment_has_nothing_to_refund(self):
+        declined = self.service.pay_order(request(number=DECLINED)).payment
+        before = self.snapshot()
+        refusal = self.refund_refusal(declined.payment_reference, {"reason": "Out of stock"})
+        self.assertEqual(refusal.code, "payment_declined")
+        self.assertEqual(refusal.message,
+                         "This payment was declined, so it took no money and there is nothing to refund.")
+        self.assertEqual(refusal.extra, {"payment_reference": declined.payment_reference})
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.service.order_status("ord_1").status, "unpaid")
+
+    def test_a_second_refund_is_refused_with_the_first_time_and_the_first_refund_stays(self):
+        payment = self.paid()
+        first = self.refund(payment.payment_reference, {"reason": "Out of stock"})
+        before = self.snapshot()
+        refusal = self.refund_refusal(payment.payment_reference, {"reason": "Customer cancelled"})
+        self.assertEqual(refusal.code, "payment_already_refunded")
+        stamp = first.refund.refunded_at
+        self.assertEqual(refusal.message, "This payment was already refunded at %s." % stamp)
+        self.assertEqual(refusal.extra, {"payment_reference": payment.payment_reference, "refunded_at": stamp})
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.store.get_payment(payment.payment_reference).refund.reason, "Out of stock")
+
+    def test_each_refusal_has_its_own_code_and_a_plain_message(self):
+        payment = self.paid()
+        declined = self.service.pay_order(request(order="ord_2", number=DECLINED)).payment
+        self.refund(payment.payment_reference, {"reason": "r"})
+        refusals = [
+            self.refund_refusal(payment.payment_reference, []),
+            self.refund_refusal(payment.payment_reference, {}),
+            self.refund_refusal(payment.payment_reference, {"reason": "x" * 501}),
+            self.refund_refusal("pay_nope", {"reason": "r"}),
+            self.refund_refusal(declined.payment_reference, {"reason": "r"}),
+            self.refund_refusal(payment.payment_reference, {"reason": "r"}),
+        ]
+        self.assertEqual([r.code for r in refusals],
+                         ["invalid_request", "reason_required", "reason_too_long", "payment_not_found",
+                          "payment_declined", "payment_already_refunded"])
+        self.assertEqual(len({r.message for r in refusals}), len(refusals))
+
+    def test_refusals_come_in_the_contracts_order(self):
+        declined = self.service.pay_order(request(number=DECLINED)).payment
+        # invalid_request, reason_required, reason_too_long, payment_not_found, payment_declined
+        self.assertEqual(self.refund_refusal("pay_nope", "x").code, "invalid_request")
+        self.assertEqual(self.refund_refusal("pay_nope", {"reason": " "}).code, "reason_required")
+        self.assertEqual(self.refund_refusal("pay_nope", {"reason": "x" * 501}).code, "reason_too_long")
+        self.assertEqual(self.refund_refusal("pay_nope", {"reason": "r"}).code, "payment_not_found")
+        self.assertEqual(self.refund_refusal(declined.payment_reference, {"reason": ""}).code, "reason_required")
+        self.assertEqual(self.refund_refusal(declined.payment_reference, {"reason": "r"}).code, "payment_declined")
+
+    def test_a_refusal_holds_no_card_data(self):
+        payment = self.paid()
+        refund = self.refund(payment.payment_reference, {"reason": "Out of stock"})
+        refusal = self.refund_refusal(payment.payment_reference, {"reason": "again"})
+        shown = repr(refund.as_dict()) + repr((refusal.message, refusal.extra))
+        shown += "\n".join(self.store._conn.iterdump())
+        self.assertNotIn(VISA_OK, shown)
+        self.assertNotIn("'%s'" % CODE, shown)
+        self.assertEqual(refund.as_dict()["card"], {"brand": "visa", "last4": "4242"})
+
+
+class RefundAndOrderTest(RefundCase):
+    def test_status_of_a_paid_order_is_paid_and_of_an_unpaid_one_unpaid(self):
+        self.assertEqual(self.service.order_status("ord_1").body()["status"], "unpaid")
+        self.service.pay_order(request(number=DECLINED))
+        declined = self.service.order_status("ord_1")
+        self.assertEqual((declined.status, declined.paid, declined.refunded_at), ("unpaid", False, None))
+        self.service.pay_order(request(), "k")
+        paid = self.service.order_status("ord_1").body()
+        self.assertEqual((paid["status"], paid["paid"], paid["refunded_at"]), ("paid", True, None))
+        self.assertTrue(all(p["refund"] is None for p in paid["payments"]))
+
+    def test_status_after_a_refund_is_refunded_with_its_time_and_the_refund_on_the_payment(self):
+        self.service.pay_order(request(number=DECLINED), "k1")
+        payment = self.service.pay_order(request(), "k2").payment
+        refunded = self.refund(payment.payment_reference, {"reason": "Customer cancelled"})
+        body = self.service.order_status("ord_1").body()
+        self.assertEqual(body["status"], "refunded")
+        self.assertFalse(body["paid"])
+        self.assertEqual(body["refunded_at"], refunded.refund.refunded_at)
+        self.assertEqual([p["outcome"] for p in body["payments"]], ["succeeded", "declined"])
+        self.assertEqual(body["payments"][0]["refund"], refunded.refund.as_dict())
+        self.assertIsNone(body["payments"][1]["refund"])
+
+    def test_a_refund_does_not_change_other_orders(self):
+        a = self.paid("a")
+        self.paid("b")
+        self.refund(a.payment_reference, {"reason": "r"})
+        self.assertEqual(self.service.order_status("a").status, "refunded")
+        self.assertEqual(self.service.order_status("b").status, "paid")
+
+    def test_list_shows_the_refund_in_its_place_and_narrowing_is_unchanged(self):
+        first = self.paid("o1")
+        self.service.pay_order(request(order="o2", number=DECLINED))
+        self.paid("o3")
+        before_all = [p.as_dict() for p in self.service.list_payments().payments]
+        before_succeeded = [p.payment_reference for p in self.service.list_payments(outcome="succeeded").payments]
+        before_declined = [p.payment_reference for p in self.service.list_payments(outcome="declined").payments]
+        refunded = self.refund(first.payment_reference, {"reason": "Out of stock"})
+        after = self.service.list_payments().payments
+        self.assertEqual([p.payment_reference for p in after], [p["payment_reference"] for p in before_all])
+        self.assertEqual([p.payment_reference for p in self.service.list_payments(outcome="succeeded").payments],
+                         before_succeeded)
+        self.assertEqual([p.payment_reference for p in self.service.list_payments(outcome="declined").payments],
+                         before_declined)
+        by_ref = {p.payment_reference: p for p in after}
+        self.assertEqual(by_ref[first.payment_reference].refund, refunded.refund)
+        self.assertEqual(by_ref[first.payment_reference].outcome, "succeeded")
+        self.assertTrue(all(p.refund is None for p in after if p.payment_reference != first.payment_reference))
+        # nothing else about the payment moved
+        changed = dict(by_ref[first.payment_reference].as_dict(), refund=None)
+        self.assertIn(changed, before_all)
+
+    def test_paying_a_refunded_order_is_refused_before_any_attempt(self):
+        payment = self.paid()
+        refunded = self.refund(payment.payment_reference, {"reason": "r"})
+        calls, before = self.processor.calls, self.snapshot()
+        refusal = self.refusal(request(number="5555555555554444", amount=100, currency="EUR"), "fresh-key")
+        self.assertEqual(refusal.code, "order_refunded")
+        self.assertEqual(refusal.message, "This order was refunded, so it cannot be paid again.")
+        self.assertEqual(refusal.extra, {"order_reference": "ord_1", "refunded_at": refunded.refund.refunded_at})
+        self.assertEqual(self.processor.calls, calls)
+        self.assertEqual(self.snapshot(), before)
+        # also without a key, and with a card that would be declined
+        self.assertEqual(self.refusal(request(number=DECLINED)).code, "order_refunded")
+        self.assertEqual(self.processor.calls, calls)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_order_refunded_is_not_remembered_under_a_key(self):
+        payment = self.paid()
+        self.refund(payment.payment_reference, {"reason": "r"})
+        self.assertEqual(self.refusal(request(number="5555555555554444"), "k").code, "order_refunded")
+        self.assertEqual(self.refusal(request(number="5555555555554444"), "k").code, "order_refunded")
+        self.assertEqual(len(self.service._keys), 0)
+
+    def test_other_orders_can_still_be_paid_after_a_refund(self):
+        self.refund(self.paid("a").payment_reference, {"reason": "r"})
+        self.assertTrue(self.service.pay_order(request(order="b")).order_paid)
+
+    def test_order_refunded_comes_before_already_paid_and_after_the_other_refusals(self):
+        payment = self.paid()
+        self.assertEqual(self.refusal(request()).code, "order_already_paid")
+        self.refund(payment.payment_reference, {"reason": "r"})
+        body = request(number="1", expiry_year=2001)
+        body["amount"] = 0
+        body["currency"] = "usd"
+        self.assertEqual(self.refusal(body).code, "invalid_request")
+        body["currency"] = "USD"
+        self.assertEqual(self.refusal(body).code, "invalid_amount")
+        body["amount"] = 5
+        self.assertEqual(self.refusal(body).code, "validation_failed")
+        body["card"] = card()
+        self.assertEqual(self.refusal(body, "k").code, "order_refunded")
+        self.assertEqual(self.refusal(body).code, "order_refunded")
+
+    def test_a_key_reused_for_a_different_request_is_judged_before_order_refunded(self):
+        payment = self.service.pay_order(request(), "k").payment
+        self.refund(payment.payment_reference, {"reason": "r"})
+        # same key, same body: replayed as the first answer (it shows no refund), not refused
+        replay = self.service.pay_order(request(), "k")
+        self.assertTrue(replay.replayed)
+        self.assertIsNone(replay.payment.refund)
+        # same key, different body: idempotency_key_reused comes first
+        self.assertEqual(self.refusal(request(amount=1), "k").code, "idempotency_key_reused")
+
+    def test_a_refund_changes_nothing_in_what_the_store_keeps_but_the_refund(self):
+        payment = self.paid()
+        before = self.store.get_payment(payment.payment_reference)
+        self.refund(payment.payment_reference, {"reason": "r"})
+        after = self.store.get_payment(payment.payment_reference)
+        self.assertEqual(after.as_dict(), dict(before.as_dict(), refund=after.refund.as_dict()))
+
+
+class RefundConcurrencyTest(RefundCase):
+    def run_threads(self, jobs):
+        outcomes = [None] * len(jobs)
+        barrier = threading.Barrier(len(jobs))
+
+        def work(index, job):
+            barrier.wait()
+            try:
+                outcomes[index] = job()
+            except Refusal as refusal:
+                outcomes[index] = refusal
+
+        threads = [threading.Thread(target=work, args=(i, job)) for i, job in enumerate(jobs)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        return outcomes
+
+    def test_two_simultaneous_refunds_give_one_success_and_one_already_refunded(self):
+        payment = self.paid()
+        outcomes = self.run_threads([
+            (lambda i=i: self.refund(payment.payment_reference, {"reason": "reason %d" % i})) for i in range(2)
+        ])
+        won = [o for o in outcomes if not isinstance(o, Refusal)]
+        lost = [o for o in outcomes if isinstance(o, Refusal)]
+        self.assertEqual((len(won), len(lost)), (1, 1))
+        self.assertEqual(lost[0].code, "payment_already_refunded")
+        self.assertEqual(lost[0].extra["refunded_at"], won[0].refund.refunded_at)
+        self.assertEqual(self.store.get_payment(payment.payment_reference).refund, won[0].refund)
+        self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0], 1)
+
+    def test_many_simultaneous_refunds_give_exactly_one_success(self):
+        payment = self.paid()
+        outcomes = self.run_threads([
+            (lambda i=i: self.refund(payment.payment_reference, {"reason": "r%d" % i})) for i in range(12)
+        ])
+        won = [o for o in outcomes if not isinstance(o, Refusal)]
+        self.assertEqual(len(won), 1)
+        self.assertTrue(all(o.code == "payment_already_refunded" for o in outcomes if isinstance(o, Refusal)))
+        self.assertEqual(self.store._conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0], 1)
+
+    def test_a_refund_waits_for_a_payment_of_the_same_order(self):
+        declined = self.service.pay_order(request(number=DECLINED)).payment
+        entered, release = threading.Event(), threading.Event()
+
+        def processor(number):
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return process_card(number)
+
+        service = PaymentService(self.store, processor)
+        order = {}
+        done = threading.Event()
+
+        def pay():
+            order["pay"] = service.pay_order(request())
+
+        def refund():
+            try:
+                service.refund_payment(declined.payment_reference, {"reason": "r"})
+            except Refusal as refusal:
+                order["refund"] = refusal
+            done.set()
+
+        pay_thread = threading.Thread(target=pay)
+        pay_thread.start()
+        self.assertTrue(entered.wait(10))
+        refund_thread = threading.Thread(target=refund)
+        refund_thread.start()
+        self.assertFalse(done.wait(0.2))  # the refund waits while the payment is in flight
+        release.set()
+        pay_thread.join(10)
+        refund_thread.join(10)
+        self.assertTrue(done.is_set())
+        self.assertTrue(order["pay"].order_paid)
+        self.assertEqual(order["refund"].code, "payment_declined")
+
+    def test_a_payment_waits_for_a_refund_of_the_same_order(self):
+        payment = self.paid()
+        inside, release = threading.Event(), threading.Event()
+        real = self.store.refund_payment
+
+        def slow_refund(*args, **kwargs):
+            inside.set()
+            self.assertTrue(release.wait(10))
+            return real(*args, **kwargs)
+
+        self.store.refund_payment = slow_refund
+        results = {}
+        done = threading.Event()
+
+        def pay():
+            try:
+                self.service.pay_order(request(number="5555555555554444"))
+            except Refusal as refusal:
+                results["pay"] = refusal
+            done.set()
+
+        refund_thread = threading.Thread(
+            target=lambda: results.update(refund=self.refund(payment.payment_reference, {"reason": "r"})))
+        refund_thread.start()
+        self.assertTrue(inside.wait(10))
+        pay_thread = threading.Thread(target=pay)
+        pay_thread.start()
+        self.assertFalse(done.wait(0.2))  # the payment waits while the refund is in flight
+        release.set()
+        refund_thread.join(10)
+        pay_thread.join(10)
+        self.assertEqual(results["pay"].code, "order_refunded")
+        self.assertEqual(results["pay"].extra["refunded_at"], results["refund"].refund.refunded_at)
+        self.assertEqual(self.processor.calls, 1)
+
+    def test_a_refund_and_a_payment_raced_never_charge_twice(self):
+        payment = self.paid()
+        outcomes = self.run_threads([
+            lambda: self.refund(payment.payment_reference, {"reason": "r"}),
+            lambda: self.service.pay_order(request(number="5555555555554444")),
+        ])
+        self.assertFalse(isinstance(outcomes[0], Refusal))
+        self.assertIn(outcomes[1].code, ("order_already_paid", "order_refunded"))
+        self.assertEqual(self.processor.calls, 1)
+        self.assertEqual(len(self.store.attempts_for_order("ord_1")), 1)
+
+    def test_no_lock_is_left_behind(self):
+        payment = self.paid()
+        self.refund(payment.payment_reference, {"reason": "r"})
+        self.refund_refusal(payment.payment_reference, {"reason": "r"})
+        self.refund_refusal("pay_nope", {"reason": "r"})
+        self.assertEqual(self.service._order_locks._locks, {})
+
+
+class RefundNoCardDataTest(RefundCase):
+    def test_nothing_returned_or_stored_about_a_refund_holds_card_data(self):
+        number, code = "4000 0000 0000 9995", "654"
+        payment = self.service.pay_order(request(number=number, security_code=code)).payment
+        refused = self.refund_refusal(payment.payment_reference, {"reason": "r"})
+        self.assertEqual(refused.code, "payment_declined")
+        good = self.service.pay_order(request(order="o2", security_code=code)).payment
+        refunded = self.refund(good.payment_reference, {"reason": "r"})
+        again = self.refund_refusal(good.payment_reference, {"reason": "r"})
+        shown = repr([refunded.as_dict(), refused.message, refused.extra, again.message, again.extra])
+        shown += repr(self.service.order_status("o2").body())
+        shown += repr([p.as_dict() for p in self.service.list_payments().payments])
+        shown += "\n".join(self.store._conn.iterdump())
+        for secret in ("4000000000009995", number, VISA_OK, "4242 4242 4242 4242"):
+            self.assertNotIn(secret, shown)
+        self.assertNotIn("'%s'" % code, shown)
+        self.assertNotIn('"%s"' % code, shown)
+        columns = [row[1] for row in self.store._conn.execute("PRAGMA table_info(refunds)")]
+        self.assertFalse({"number", "card_number", "security_code", "cvv", "brand", "last4"} & set(columns))
 
 
 if __name__ == "__main__":
