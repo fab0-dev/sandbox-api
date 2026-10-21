@@ -740,12 +740,18 @@ class RefundPaymentApiTest(RefundApiCase):
 
     def test_two_simultaneous_refunds_give_one_200_and_one_already_refunded(self):
         payment = self.make_payment()
-        results = [None] * 6
+        # At most 5 connections: ThreadingHTTPServer's listen backlog is 5, and a sixth
+        # simultaneous connection is sometimes reset on macOS.
+        results = [None] * 5
+        errors = []
         barrier = threading.Barrier(len(results))
 
         def work(index):
-            barrier.wait()
-            results[index] = self.refund(payment["payment_reference"], {"reason": "reason %d" % index})
+            try:
+                barrier.wait()
+                results[index] = self.refund(payment["payment_reference"], {"reason": "reason %d" % index})
+            except BaseException as error:
+                errors.append((index, repr(error)))
 
         threads = [threading.Thread(target=work, args=(i,)) for i in range(len(results))]
         for t in threads:
@@ -753,6 +759,7 @@ class RefundPaymentApiTest(RefundApiCase):
         for t in threads:
             t.join(10)
             self.assertFalse(t.is_alive())
+        self.assertEqual(errors, [])
         won = [r for r in results if r.status == 200]
         lost = [r for r in results if r.status != 200]
         self.assertEqual(len(won), 1)
